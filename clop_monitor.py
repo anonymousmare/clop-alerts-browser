@@ -1667,8 +1667,8 @@ def apply_roster(orders: Sequence[MarketOrder], roster: FrozenSet[int]) -> Tuple
     return tuple(replace(order, is_ally=order.nation_id in roster) for order in orders)
 
 
-def require_page_nation(stock: Stockpiles, nation: AccountNation) -> None:
-    """Refuse an overview page that is not ``nation``'s own.
+def require_page_nation(stock: Stockpiles, expected: str) -> None:
+    """Refuse an overview page that is not the nation named ``expected``.
 
     The switch was already confirmed from the header; this is the second, independent check,
     against the name overview.php prints for the nation it is showing. Both come from
@@ -1676,9 +1676,9 @@ def require_page_nation(stock: Stockpiles, nation: AccountNation) -> None:
     buildings and stock would be written over the other nation's sheet tab.
     """
     shown = " ".join((stock.nation_name or "").split())
-    if shown.casefold() != " ".join(nation.name.split()).casefold():
+    if shown.casefold() != " ".join(expected.split()).casefold():
         raise NationSwitchError(
-            f"overview.php showed {shown or 'no nation name'!r} where {nation.name!r} was expected"
+            f"overview.php showed {shown or 'no nation name'!r} where {expected!r} was expected"
         )
 
 
@@ -2102,7 +2102,7 @@ class ClopClient:
                 stockpiles: Optional[Stockpiles] = None
                 if self.market_goods or nation.nation_id in overview_for:
                     overview_html, stockpiles = read_overview_stockpiles(self)
-                    require_page_nation(stockpiles, nation)
+                    require_page_nation(stockpiles, nation.name)
                 nation_orders = orders
                 alliance_id = self.alliance_ids.get(nation.nation_id)
                 if orders and alliance_id is not None:
@@ -2163,6 +2163,16 @@ class ClopClient:
         latest_news = parse_latest_news(news_html)
         if "<h3>News</h3>" in news_html and "No news yet." not in news_html and latest_news is None:
             raise MonitorError("The newest news entry could not be parsed")
+        if self.nations:
+            # The header lists the account's nations on every page, so a nation founded or lost
+            # while running is picked up here for free; main re-plans the sheet sync when this
+            # list changes. Only once discovered, so nothing switches before it was asked to.
+            header_nations = tuple(parse_header_nations(navigation_html))
+            if header_nations:
+                self.nations, self.switchable = header_nations, True
+            elif self.switchable:
+                # Down to one nation, which only the empire overview names.
+                self.discover_nations()
         if self.switchable:
             # include_market=False is the refresh after a dismissed dialog, which re-reads only
             # the counts; check_and_notify keeps every nation's half from the poll that alerted.
@@ -2680,8 +2690,13 @@ def sync_sheet_step(
     last_synced: Optional[str] = None,
     *,
     alerts: AlertCategorySettings = AlertCategorySettings(),
+    expected_nation: Optional[str] = None,
 ) -> Optional[str]:
     """Sync the nation's tab from overview.php, after the regular alerting.
+
+    ``expected_nation`` is the in-game name the page must show. When given, a page for any
+    other nation is refused before a single cell is read or written: on a multi-nation account
+    that is the one mistake that would put one nation's numbers on another's tab.
 
     Three syncs off one page fetch, in this order:
 
@@ -2744,6 +2759,8 @@ def sync_sheet_step(
     try:
         if overview_html is None or stock is None:
             overview_html, stock = read_overview_stockpiles(client)
+        if expected_nation is not None:
+            require_page_nation(stock, expected_nation)
         status = NationStatus.from_overview(overview_html)
 
         phase = "the building reconcile"
@@ -3113,6 +3130,70 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def start_sheet_sync(
+    nations: Sequence[AccountNation],
+    configured: Optional[Tuple[Tuple[str, NationSettings], ...]],
+    env_path: Path,
+    notifier: Notifier,
+) -> List[Tuple[SheetTarget, object]]:
+    """Plan the sheet sync and check every planned tab, returning the targets to sync.
+
+    Each warning from the plan is a dialog, not a terminal line: with sync off the monitor looks
+    perfectly healthy -- it polls, it alerts, it says nothing -- while a tab is never updated.
+    The only symptom is a W10 that stopped advancing, which nobody sees until they need it.
+
+    A missing tab is configuration and switches that nation's sync off. An unreachable sheet is
+    weather and leaves it on: switching off meant one passing Google outage at startup killed
+    the sheet for the whole session, with the tab silently going stale.
+    """
+    # Imported here, not at module scope: sheets.py imports load_env_file from this module.
+    from sheets import EXEC_URL, GoogleSheet, SheetError, SheetTabMissing, nation_from_env
+
+    try:
+        env_nation: Optional[str] = nation_from_env(env_path)
+    except SheetError:
+        env_nation = None
+    targets, warnings = plan_sheet_sync(nations, configured, env_nation, EXEC_URL)
+    for warning in warnings:
+        notifier.notify_failure(warning)
+
+    sheets_by_url: Dict[str, object] = {}
+    ready: List[Tuple[SheetTarget, object]] = []
+    for target in targets:
+        if target.sheet_url not in sheets_by_url:
+            sheets_by_url[target.sheet_url] = GoogleSheet(target.sheet_url)
+        sheet = sheets_by_url[target.sheet_url]
+        try:
+            sheet.require_tab(target.tab)
+            print(
+                f"Sheet sync on for {target.nation.name}: reconciling buildings and "
+                f"snapshotting stockpiles into tab {target.tab!r}. The first poll writes "
+                "everything; after that the sheet is only touched when the game's numbers "
+                "actually change.",
+                flush=True,
+            )
+        except SheetTabMissing as error:
+            notifier.notify_failure(
+                f"Sheet sync is off for {target.nation.name}: {error}\n\n"
+                "Fix the nations section of settings.json (or CLOP_NATION) or the sheet, then "
+                "restart the monitor."
+            )
+            continue
+        except SheetError as error:
+            notifier.notify_failure(
+                f"Could not reach the sheet for {target.nation.name} at startup: {error}\n\n"
+                "This looks like a passing outage rather than a configuration problem, so "
+                "sheet sync stays ON and the first poll will try again."
+            )
+            print(
+                f"Sheet sync on (unverified -- the startup check could not reach Google) for "
+                f"{target.nation.name}, tab {target.tab!r}.",
+                flush=True,
+            )
+        ready.append((target, sheet))
+    return ready
+
+
 def report_fatal(notifier: Notifier, message: str, code: int) -> int:
     """Alert that the monitor is stopping, then return its exit code."""
     notifier.notify_failure(f"{message}\n\nThe monitor has stopped and is no longer polling.")
@@ -3199,6 +3280,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         previous = load_snapshot(args.state) if settings.cache.persist_to_file else None
         client.login()
+        # Before the market preflight, which resolves each nation's alliance from this list.
+        nations = client.discover_nations()
+        print(
+            "Account nations: "
+            + ", ".join(f"{nation.name} (#{nation.nation_id})" for nation in nations)
+            + ".",
+            flush=True,
+        )
         market_message = client.market_preflight(goods_to_watch(settings.alerts))
         if market_message is not None:
             print(market_message, flush=True)
@@ -3213,65 +3302,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
 
-        # Sheet sync (buildings + stockpiles) is on whenever CLOP_NATION names a tab in the shared
-        # sheet. Unset -> the monitor runs exactly as before; a missing/unreachable tab -> warn and
-        # stay off rather than fail every poll.
-        from sheets import GoogleSheet, SheetError, SheetTabMissing, nation_from_env
+        # Sheet sync (buildings + stockpiles), per nation, wherever the nations section of
+        # settings.json -- or CLOP_NATION, on a one-nation account -- names a tab. A missing tab
+        # warns and stays off rather than failing every poll.
+        from sheets import SheetTabMissing
 
-        sync_sheet: Optional[GoogleSheet] = None
-        sync_nation: Optional[str] = None
-        try:
-            sync_nation = nation_from_env(args.env_file.resolve())
-        except SheetError:
-            # A dialog, not a terminal line. With sync off the monitor looks perfectly healthy --
-            # it polls, it alerts, it says nothing -- while the sheet is never updated once. The
-            # only symptom is a W10 that stopped advancing, which nobody sees until they need it.
-            notifier.notify_failure(
-                "Sheet sync is OFF, so your nation tab will not be updated at all: no building "
-                "counts, no stockpile numbers, and no W10 timestamp.\n\n"
-                "CLOP_NATION is not set. Add it to .env as CLOP_NATION=<your nation>, using the "
-                "exact name of your tab in the shared sheet, then restart the monitor.\n\n"
-                "Everything else (messages, news, reports) keeps working meanwhile."
-            )
-        else:
-            sync_sheet = GoogleSheet()
-            try:
-                sync_sheet.require_tab(sync_nation)
-                print(
-                    f"Sheet sync on: reconciling buildings and snapshotting stockpiles for "
-                    f"{sync_nation!r}. The first poll writes everything; after that the sheet is "
-                    "only touched when the game's numbers actually change.",
-                    flush=True,
-                )
-            except SheetTabMissing as error:
-                # Definitive: the tab is not there, and it will not be there in a minute either.
-                # Somebody has to fix .env or the sheet, so stay off rather than nag every poll.
-                notifier.notify_failure(
-                    f"Sheet sync is off: {error}\n\n"
-                    "Fix CLOP_NATION or the sheet, then restart the monitor."
-                )
-                sync_sheet = None
-            except SheetError as error:
-                # Weather, not configuration. Switching sync off here meant one passing Google
-                # outage at startup killed the sheet for the whole session -- with the monitor
-                # looking perfectly healthy while the tab silently went stale. Stay on; the first
-                # poll checks again, and reports properly if it is still broken.
-                notifier.notify_failure(
-                    f"Could not reach the shared sheet at startup: {error}\n\n"
-                    "This looks like a passing outage rather than a configuration problem, so "
-                    "sheet sync stays ON and the first poll will try again."
-                )
-                print(
-                    f"Sheet sync on (unverified -- the startup check could not reach Google) "
-                    f"for {sync_nation!r}.",
-                    flush=True,
-                )
+        env_path = args.env_file.resolve()
+        sync_targets = start_sheet_sync(client.nations, settings.nations, env_path, notifier)
+        #: What the sync plan was made from; a change to either re-plans it.
+        planned = (client.nations, settings.nations)
 
         loaded = LoadedSettings(settings, settings_source)
-        # Digest of the last fully clean sheet sync; None means "nothing cached", which is what
-        # makes the first poll write everything. Held here rather than in a module global so a
-        # restart always re-reconciles and the tests can drive it directly.
-        sheet_synced: Optional[str] = None
+        # Digest of each nation's last fully clean sheet sync; absent means "nothing cached",
+        # which is what makes the first poll write everything. Held here rather than in a module
+        # global so a restart always re-reconciles and the tests can drive it directly.
+        sheet_synced: Dict[int, Optional[str]] = {}
         while True:
             # Before the check rather than after it, so that an edit takes effect on the very
             # next poll rather than the one after.
@@ -3279,13 +3324,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 settings_path, loaded, client, notifier, build_notifier
             )
             settings = loaded.settings
+            if (client.nations, settings.nations) != planned:
+                # A nations edit, or a nation founded or lost while running. Digests are kept:
+                # they describe the game, and a target that is new to the plan has none anyway.
+                sync_targets = start_sheet_sync(
+                    client.nations, settings.nations, env_path, notifier
+                )
+                planned = (client.nations, settings.nations)
             poll_failed = False
             try:
                 # A watched market needs the current stock before any order can alert. When
-                # sheet sync is also on, both consumers share this one fetch and one parse.
+                # sheet sync is also on, both consumers share this one fetch and one parse. A
+                # multi-nation account reads each nation's overview during its visit instead.
                 overview_html: Optional[str] = None
                 stockpiles: Optional[Stockpiles] = None
-                if goods_to_watch(settings.alerts):
+                if goods_to_watch(settings.alerts) and not client.switchable:
                     overview_html, stockpiles = read_overview_stockpiles(client)
 
                 current, paused_for_alert = check_and_notify(
@@ -3296,6 +3349,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     settings.alerts,
                     settings.cache.persist_to_file,
                     stockpiles,
+                    overview_for=(
+                        frozenset(target.nation.nation_id for target, _ in sync_targets)
+                        if client.switchable
+                        else frozenset()
+                    ),
                 )
                 previous = current
 
@@ -3321,35 +3379,76 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # alerts were late, which is what a tight retry budget was invented to protect --
                 # a constraint that simply does not exist once the order is right.
                 #
-                # Without a watched market this reads overview itself; with one it receives the
-                # object prepared above.
-                if sync_sheet is not None and sync_nation is not None:
+                # Each nation's page comes from this poll's reads where there is one: the
+                # up-front read on a one-nation account, the nation's visit on a multi-nation
+                # one. Without one, the step reads overview itself -- after switching to the
+                # nation, on an account where there is anything to switch.
+                pages: Dict[int, Tuple[Optional[str], Optional[Stockpiles]]] = {}
+                skipped = {e.nation.nation_id for e in current.nations if e.skipped is not None}
+                if not paused_for_alert:
+                    if client.switchable:
+                        pages = {
+                            entry.nation.nation_id: (entry.overview_html, entry.snapshot.stockpiles)
+                            for entry in current.nations
+                            if entry.skipped is None
+                        }
+                    elif client.nations:
+                        pages = {client.nations[0].nation_id: (overview_html, stockpiles)}
+                for target, sheet in list(sync_targets):
+                    nation_id = target.nation.nation_id
+                    if nation_id in skipped:
+                        # Already reported by check_and_notify, and never written while unread.
+                        continue
+                    page, stock = pages.get(nation_id, (None, None))
+                    if page is None and client.switchable:
+                        try:
+                            client.select_nation(target.nation)
+                        except NationSwitchError as error:
+                            notifier.notify_failure(
+                                f"Sheet sync skipped for {target.nation.name}: {error}. No cell "
+                                "was written; the next check tries again."
+                            )
+                            continue
                     try:
-                        sheet_synced = sync_sheet_step(
+                        sheet_synced[nation_id] = sync_sheet_step(
                             client,
-                            sync_sheet,
-                            sync_nation,
+                            sheet,
+                            target.tab,
                             notifier,
-                            overview_html,
-                            stockpiles,
-                            sheet_synced,
+                            page,
+                            stock,
+                            sheet_synced.get(nation_id),
                             alerts=settings.alerts,
+                            expected_nation=target.nation.name,
                         )
                     except SheetTabMissing as error:
                         notifier.notify_failure(
-                            f"Sheet sync is off: {error}\n\nFix CLOP_NATION or the sheet, then "
-                            "restart the monitor. Everything else keeps working."
+                            f"Sheet sync is off for {target.nation.name}: {error}\n\nFix the "
+                            "nations section of settings.json (or CLOP_NATION) or the sheet, "
+                            "then restart the monitor. Everything else keeps working."
                         )
-                        sync_sheet = None
+                        sync_targets.remove((target, sheet))
+                if current.nations:
+                    latest_report = ", ".join(
+                        f"{entry.nation.name}="
+                        f"{entry.snapshot.latest_report[1] if entry.snapshot.latest_report else 'none'}"
+                        for entry in current.nations
+                    )
+                else:
+                    latest_report = (
+                        current.latest_report[1] if current.latest_report else "none"
+                    )
                 print(
                     f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
                     f"checked: user={current.user_messages}, "
                     f"alliance={current.alliance_messages}, "
                     f"latest_news={current.latest_news[1] if current.latest_news else 'none'}, "
-                    f"latest_report={current.latest_report[1] if current.latest_report else 'none'}, "
+                    f"latest_report={latest_report}, "
                     "fourchan_post="
                     f"{current.fourchan_post.number if current.fourchan_post else 'disabled'}, "
-                    f"market_orders={len(current.market_orders)}",
+                    # Every nation sees the same order list, so it is counted once.
+                    "market_orders="
+                    f"{max((len(e.snapshot.market_orders) for e in current.nations), default=len(current.market_orders))}",
                     flush=True,
                 )
             except (AuthenticationError, ArchivedThreadError):

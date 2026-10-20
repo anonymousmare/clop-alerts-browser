@@ -2232,9 +2232,15 @@ class FailureNotificationTests(unittest.TestCase):
 
             def __init__(self, *args, **kwargs):
                 del args, kwargs
+                self.nations = ()
+                self.switchable = False
 
             def login(self):
                 return None
+
+            def discover_nations(self):
+                self.nations = (clop_monitor.AccountNation(1, "Our Nation"),)
+                return self.nations
 
             def market_preflight(self, goods):
                 del goods
@@ -4581,9 +4587,15 @@ class PollingClient:
         self.initial_fourchan_post = kwargs.get("initial_fourchan_post")
         self.market_goods = ()
         self.alliance_id = None
+        self.nations = ()
+        self.switchable = False
 
     def login(self):
         return None
+
+    def discover_nations(self):
+        self.nations = (clop_monitor.AccountNation(1, "Our Nation"),)
+        return self.nations
 
     def market_preflight(self, goods):
         del goods
@@ -5329,12 +5341,54 @@ class SheetSyncOffTests(unittest.TestCase):
         cell. The only symptom is a W10 that stopped advancing, which nobody sees until they need
         it -- so the user is told at startup, in a dialog.
         """
-        source = inspect.getsource(clop_monitor.main)
-        start = source.index("nation_from_env(")
-        branch = source[start:start + 600]
-        self.assertIn("notify_failure", branch)
-        self.assertIn("Sheet sync is OFF", branch)
-        self.assertNotIn('print("Sheet sync off', branch)
+        notifier = RecordingFailures()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            clop_monitor.os.environ, {}, clear=True
+        ), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            targets = clop_monitor.start_sheet_sync(
+                (clop_monitor.AccountNation(1, "Our Nation"),),
+                None,
+                Path(directory) / "absent.env",
+                notifier,
+            )
+        self.assertEqual(targets, [])
+        self.assertEqual(len(notifier.failures), 1)
+        self.assertIn("Sheet sync is OFF", notifier.failures[0])
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_each_nation_gets_its_own_spreadsheet_and_tab(self):
+        import sheets
+
+        opened = []
+
+        class Sheet:
+            def __init__(self, url):
+                opened.append(url)
+
+            def require_tab(self, tab):
+                if tab == "Ghost":
+                    raise sheets.SheetTabMissing("no such tab: Ghost")
+
+        configured = (
+            ("First Nation", clop_monitor.NationSettings(tab="First(Z)")),
+            ("Second Nation", clop_monitor.NationSettings(sheet_url="https://other/exec")),
+            ("Third Nation", clop_monitor.NationSettings(tab="Ghost")),
+        )
+        nations = tuple(
+            clop_monitor.AccountNation(i, n)
+            for i, n in ((11, "First Nation"), (12, "Second Nation"), (13, "Third Nation"))
+        )
+        notifier = RecordingFailures()
+        with mock.patch.object(sheets, "GoogleSheet", Sheet), contextlib.redirect_stdout(io.StringIO()):
+            targets = clop_monitor.start_sheet_sync(nations, configured, Path("absent.env"), notifier)
+        self.assertEqual(
+            [(t.nation.name, t.tab, t.sheet_url) for t, _ in targets],
+            [("First Nation", "First(Z)", sheets.EXEC_URL), ("Second Nation", "Second Nation", "https://other/exec")],
+        )
+        # One connection per spreadsheet, however many tabs it holds.
+        self.assertEqual(opened, [sheets.EXEC_URL, "https://other/exec"])
+        self.assertEqual(len(notifier.failures), 1)
+        self.assertIn("Sheet sync is off for Third Nation", notifier.failures[0])
 
 
 class OpenTransportFailureTests(unittest.TestCase):
@@ -5589,6 +5643,8 @@ class TwoNationAccount:
             "reports.php": lambda form: self.chrome()
             + reports_page(self.reports.get(self.state["active"], [])),
             "overview.php": self.overview,
+            # A fresh session lands on the first nation, as backend_login.php:57 does.
+            "login.php": lambda form: self.login(),
         }
         if market_rows is not None:
             market = market_responder(market_rows)
@@ -5598,7 +5654,14 @@ class TwoNationAccount:
         self.client, self.calls = market_client(pages, goods=goods)
 
     def chrome(self):
-        return switcher_page(self.state["active"], header=QUIET_HEADER)
+        return switcher_page(self.state["active"], self.nations, header=QUIET_HEADER)
+
+    #: The nations the header lists; a test can add one to found a nation mid-run.
+    nations = TWO_NATIONS
+
+    def login(self):
+        self.state["active"] = self.nations[0][0]
+        return self.chrome()
 
     def overview(self, form):
         if form is not None and "switchnation_id" in form:
@@ -5779,6 +5842,134 @@ class MultiNationPollTests(unittest.TestCase):
         current = account.client.snapshot()
         allies = {n.nation.nation_id: n.snapshot.market_orders[0].is_ally for n in current.nations}
         self.assertEqual(allies, {11: True, 12: False})
+
+    def test_a_nation_founded_mid_run_joins_the_walk(self):
+        account = TwoNationAccount()
+        account.overview_names[13] = "Third Nation"
+        account.client.discover_nations()
+        account.nations = TWO_NATIONS + ((13, "Third Nation"),)
+        current = account.client.snapshot()
+        self.assertEqual([n.nation.nation_id for n in current.nations], [11, 12, 13])
+        self.assertEqual(len(account.client.nations), 3)
+
+
+class MultiNationThroughMainTests(SettingsReloadThroughMainTests):
+    """Two nations, two tabs, end to end through main(): each tab gets only its own nation."""
+
+    def _drive(self, nations_section, paused=False):
+        import sheets
+
+        account = TwoNationAccount(reports={11: ["A"], 12: ["B"]})
+        synced = []
+
+        class Sheet:
+            def __init__(self, url):
+                self.url = url
+
+            def require_tab(self, tab):
+                return None
+
+        def fake_step(client, sheet, tab, notifier, overview_html=None, stock=None, last=None, **kwargs):
+            del notifier, last
+            if overview_html is None:
+                overview_html, stock = clop_monitor.read_overview_stockpiles(client)
+            synced.append((tab, sheet.url, stock.nation_name, kwargs["expected_nation"]))
+            return "digest"
+
+        class Notifying(Notifier):
+            def notify(self, message):
+                del message
+                return paused
+
+            def notify_failure(self, message):
+                failures.append(message)
+                return True
+
+        failures = []
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            def sleep(seconds):
+                raise KeyboardInterrupt
+
+            if paused:
+                # Something to alert on, so the dialog stands and the visit's pages go stale.
+                account.reports[11] = ["A2", "A"]
+                save_snapshot(
+                    Path(directory) / "state.json",
+                    Snapshot(0, 0, None, nations=(
+                        clop_monitor.NationSnapshot(
+                            clop_monitor.AccountNation(11, "First Nation"),
+                            Snapshot(0, 0, None, latest_report=("A", "2026-08-17 08:01:00"), reports_checked=True),
+                        ),
+                    )),
+                )
+            with mock.patch.object(clop_monitor, "Notifier", Notifying), mock.patch.object(
+                sheets, "GoogleSheet", Sheet
+            ), mock.patch.object(clop_monitor, "sync_sheet_step", fake_step):
+                _, code = self._run(
+                    directory,
+                    {"nations": nations_section},
+                    sleep,
+                    client=lambda *a, **k: account.client,
+                )
+        self.assertEqual(code, 0)
+        return synced, failures, account
+
+    def test_each_tab_is_synced_from_its_own_nations_page(self):
+        synced, failures, account = self._drive(
+            {"First Nation": {"tab": "First(Z)"}, "Second Nation": {"sheet_url": "https://other/exec"}}
+        )
+        import sheets
+
+        self.assertEqual(
+            synced,
+            [
+                ("First(Z)", sheets.EXEC_URL, "First Nation", "First Nation"),
+                ("Second Nation", "https://other/exec", "Second Nation", "Second Nation"),
+            ],
+        )
+        self.assertEqual(failures, [])
+        # The visit's pages were used, so the sync cost no further switches.
+        switches = [f for p, f in account.calls if f and "switchnation_id" in f]
+        self.assertEqual(switches, [{"switchnation_id": "11"}, {"switchnation_id": "12"}])
+
+    def test_after_a_dialog_each_nation_is_switched_to_before_its_page_is_reread(self):
+        synced, _, _ = self._drive(
+            {"First Nation": {"tab": "First(Z)"}, "Second Nation": {}}, paused=True
+        )
+        self.assertEqual(
+            [(tab, shown) for tab, _, shown, _ in synced],
+            [("First(Z)", "First Nation"), ("Second Nation", "Second Nation")],
+        )
+
+    def test_clop_nation_alone_writes_nothing_on_a_multi_nation_account(self):
+        import sheets
+
+        account = TwoNationAccount()
+        calls = []
+        failures = []
+
+        class Notifying(Notifier):
+            def notify(self, message):
+                return False
+
+            def notify_failure(self, message):
+                failures.append(message)
+                return True
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(clop_monitor, "Notifier", Notifying), mock.patch.object(
+                clop_monitor, "sync_sheet_step", lambda *a, **k: calls.append(a)
+            ):
+                _, code = self._run(
+                    directory,
+                    {},
+                    lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
+                    client=lambda *a, **k: account.client,
+                    env={"CLOP_NATION": "LePone(Z)"},
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("cannot tell" in f for f in failures))
 
 
 class NationSettingsTests(unittest.TestCase):
