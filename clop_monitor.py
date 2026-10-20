@@ -1371,6 +1371,11 @@ class Snapshot:
     market_orders: Tuple[MarketOrder, ...] = ()
     #: This poll's overview stockpile. Not persisted: it is live availability data.
     stockpiles: Optional[Stockpiles] = None
+    #: One entry per nation, on an account with more than one. A one-nation account keeps its
+    #: reports, market orders and stockpile in the fields above; a multi-nation account leaves
+    #: those empty and carries them here instead, because each nation has its own. Only each
+    #: nation's report marker is persisted.
+    nations: Tuple["NationSnapshot", ...] = ()
 
     def to_json(self) -> Dict[str, object]:
         return {
@@ -1390,6 +1395,22 @@ class Snapshot:
                 else None
             ),
             "reports_checked": self.reports_checked,
+            "nations": [
+                {
+                    "nation_id": entry.nation.nation_id,
+                    "name": entry.nation.name,
+                    "latest_report": (
+                        {
+                            "message": entry.snapshot.latest_report[0],
+                            "posted": entry.snapshot.latest_report[1],
+                        }
+                        if entry.snapshot.latest_report is not None
+                        else None
+                    ),
+                    "reports_checked": entry.snapshot.reports_checked,
+                }
+                for entry in self.nations
+            ],
             "observed_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1438,6 +1459,24 @@ class Snapshot:
             alliance_messages = int(value.get("alliance_messages", 0))
         except (TypeError, ValueError) as error:
             raise MonitorError("Saved message counts are not integers") from error
+        # A state file from before multi-nation support has no "nations" key, which loads as
+        # none: a one-nation account still reads its marker from the fields above.
+        raw_nations = value.get("nations", [])
+        if not isinstance(raw_nations, list):
+            raise MonitorError("Saved nations value is not a list")
+        nations: List[NationSnapshot] = []
+        for raw_nation in raw_nations:
+            if not isinstance(raw_nation, dict):
+                raise MonitorError("A saved nation is not a JSON object")
+            try:
+                nation = AccountNation(int(raw_nation["nation_id"]), str(raw_nation["name"]))
+            except (KeyError, TypeError, ValueError) as error:
+                raise MonitorError("A saved nation has no valid nation_id and name") from error
+            nations.append(
+                NationSnapshot(nation, cls.from_json(
+                    {key: raw_nation[key] for key in ("latest_report", "reports_checked") if key in raw_nation}
+                ))
+            )
         return cls(
             user_messages=user_messages,
             alliance_messages=alliance_messages,
@@ -1445,6 +1484,50 @@ class Snapshot:
             fourchan_post=fourchan_post,
             latest_report=latest_report,
             reports_checked=reports_checked,
+            nations=tuple(nations),
+        )
+
+
+@dataclass(frozen=True)
+class NationSnapshot:
+    """One nation's half of a poll on a multi-nation account.
+
+    ``snapshot`` holds what is per nation -- its reports, its view of the buy orders and its
+    stockpile -- and nothing else; the login-wide counts, news and 4chan post live on the outer
+    snapshot. ``skipped`` says why nothing could be read for the nation this poll, in which case
+    ``snapshot`` is empty and must not be taken as the nation's state.
+    """
+
+    nation: AccountNation
+    snapshot: Snapshot
+    #: overview.php as read for this nation this poll, for the sheet sync. Not persisted.
+    overview_html: Optional[str] = None
+    skipped: Optional[str] = None
+
+
+def apply_roster(orders: Sequence[MarketOrder], roster: FrozenSet[int]) -> Tuple[MarketOrder, ...]:
+    """The orders with alliance membership judged against one nation's alliance roster.
+
+    The buyer's market colours friends and enemies by user (buyermarketplace.php:65), so the
+    order list is the same for every nation on a login and is fetched once. Alliance is the one
+    relation that differs between an account's nations, so it is applied per nation here --
+    exactly what parse_market_orders does when it is handed a roster.
+    """
+    return tuple(replace(order, is_ally=order.nation_id in roster) for order in orders)
+
+
+def require_page_nation(stock: Stockpiles, nation: AccountNation) -> None:
+    """Refuse an overview page that is not ``nation``'s own.
+
+    The switch was already confirmed from the header; this is the second, independent check,
+    against the name overview.php prints for the nation it is showing. Both come from
+    nations.name. A page for one nation taken as another's is the bug this exists to stop: its
+    buildings and stock would be written over the other nation's sheet tab.
+    """
+    shown = " ".join((stock.nation_name or "").split())
+    if shown.casefold() != " ".join(nation.name.split()).casefold():
+        raise NationSwitchError(
+            f"overview.php showed {shown or 'no nation name'!r} where {nation.name!r} was expected"
         )
 
 
@@ -1474,6 +1557,9 @@ class ClopClient:
         #: The zero comes from the game: viewnation.php:23 renders the alliance link even for
         #: a nation in no alliance, pointing it at alliance 0.
         self.alliance_id: Optional[int] = None
+        #: The same, per nation, on a multi-nation account: its nations can sit in different
+        #: alliances. Empty means not resolved, exactly as ``alliance_id`` None does.
+        self.alliance_ids: Dict[int, int] = {}
         #: Every nation on the account, filled in by discover_nations.
         self.nations: Tuple[AccountNation, ...] = ()
         #: Whether the header has a nation switcher, which header.php renders only for an
@@ -1573,8 +1659,8 @@ class ClopClient:
             comment=comment,
         )
 
-    def _alliance_roster(self) -> FrozenSet[int]:
-        """The nation ids in this account's alliance.
+    def _alliance_roster(self, alliance_id: Optional[int] = None) -> FrozenSet[int]:
+        """The nation ids in this account's alliance, or in ``alliance_id`` when given.
 
         Read from viewalliance.php. myalliance.php is never used: it sets
         alliance_messages_last_checked on every load, which would silently mark the alliance
@@ -1584,15 +1670,17 @@ class ClopClient:
         different facts, and answering the second with an empty roster would report every
         ally as a stranger rather than admitting the gap.
         """
-        if self.alliance_id is None:
+        if alliance_id is None:
+            alliance_id = self.alliance_id
+        if alliance_id is None:
             raise MonitorError(
                 "The account's alliance has not been resolved; market_preflight must run "
                 "before the alliance roster can be read"
             )
-        if self.alliance_id == 0:
+        if alliance_id == 0:
             return frozenset()
         roster = parse_alliance_nation_ids(
-            self._open(f"viewalliance.php?alliance_id={self.alliance_id}")
+            self._open(f"viewalliance.php?alliance_id={alliance_id}")
         )
         # You are a member of the alliance you looked up, so your own nation is always in
         # that table: an empty parse means the fetch failed, not that the alliance is empty.
@@ -1601,7 +1689,7 @@ class ClopClient:
         # for.
         if not roster:
             raise MonitorError(
-                f"The alliance page for alliance {self.alliance_id} listed no member nations, "
+                f"The alliance page for alliance {alliance_id} listed no member nations, "
                 'so the roster could not be read. Set "alliance": false on your watched '
                 "goods in settings.json to run without the alliance check."
             )
@@ -1716,8 +1804,31 @@ class ClopClient:
         # that failed part-way must not leave a caller watching goods with alliance detection
         # silently degraded to the green-colour heuristic the roster exists to replace.
         alliance_id: Optional[int] = None
+        alliance_ids: Dict[int, int] = {}
         message = f"Market preflight passed; watching {watching} (friends only)."
-        if any(good.alliance for good in goods):
+        if any(good.alliance for good in goods) and self.switchable:
+            # viewnation.php takes the nation in the URL, so no switching is needed here.
+            described = []
+            for nation in self.nations:
+                link = parse_alliance_link(
+                    self._open(f"viewnation.php?nation_id={nation.nation_id}")
+                )
+                if link is None:
+                    raise MonitorError(
+                        f"Could not read the alliance of {nation.name}: its page has no "
+                        'alliance link. Set "alliance": false on your watched goods in '
+                        "settings.json to run without the alliance check."
+                    )
+                alliance_ids[nation.nation_id] = link[0]
+                described.append(
+                    f"{nation.name} in no alliance"
+                    if link[0] == 0
+                    else f"{nation.name} in {link[1]} (#{link[0]})"
+                )
+            message = (
+                f"Market preflight passed; watching {watching}; " + ", ".join(described) + "."
+            )
+        elif any(good.alliance for good in goods):
             nation_id = self._own_nation_id(self._open("index.php"))
             link = parse_alliance_link(self._open(f"viewnation.php?nation_id={nation_id}"))
             if link is None:
@@ -1742,6 +1853,7 @@ class ClopClient:
 
         self.market_goods = market_goods
         self.alliance_id = alliance_id
+        self.alliance_ids = alliance_ids
         return message
 
     def login(self) -> str:
@@ -1808,11 +1920,79 @@ class ClopClient:
             self._switch_to(nation.nation_id)
         self.active_nation_id = nation.nation_id
 
+    def _nation_snapshots(self, overview_for: FrozenSet[int]) -> Tuple[NationSnapshot, ...]:
+        """Switch to each nation in turn and read its reports, overview and buy orders.
+
+        A nation that cannot be read -- the switch landed elsewhere, its overview names another
+        nation, a page would not load -- is skipped with the reason, and the others are still
+        read. Only a failed login stops the walk, because it would fail every nation after it.
+        """
+        # One fetch serves every nation: the colours are per user, and alliance is applied per
+        # nation below. Fetched before the walk so a market failure costs no switches.
+        orders = self._market_orders(None) if self.market_goods else ()
+        rosters: Dict[int, FrozenSet[int]] = {}
+        result: List[NationSnapshot] = []
+        for nation in self.nations:
+            try:
+                self.select_nation(nation)
+                reports_html = self._open("reports.php")
+                if not is_logged_in(reports_html):
+                    # login() puts the fresh session back on this nation before returning.
+                    self.login()
+                    reports_html = self._open("reports.php")
+                if not is_logged_in(reports_html) or "<h3>Reports</h3>" not in reports_html:
+                    raise MonitorError("The authenticated reports page could not be read")
+                if parse_current_nation_id(reports_html) != nation.nation_id:
+                    raise NationSwitchError(
+                        f"reports.php was not showing {nation.name} when it was read"
+                    )
+                report_rows = parse_report_rows(reports_html)
+                overview_html: Optional[str] = None
+                stockpiles: Optional[Stockpiles] = None
+                if self.market_goods or nation.nation_id in overview_for:
+                    overview_html, stockpiles = read_overview_stockpiles(self)
+                    require_page_nation(stockpiles, nation)
+                nation_orders = orders
+                alliance_id = self.alliance_ids.get(nation.nation_id)
+                if orders and alliance_id is not None:
+                    if alliance_id not in rosters:
+                        rosters[alliance_id] = self._alliance_roster(alliance_id)
+                    nation_orders = apply_roster(orders, rosters[alliance_id])
+                result.append(
+                    NationSnapshot(
+                        nation,
+                        Snapshot(
+                            0,
+                            0,
+                            None,
+                            latest_report=report_rows[0] if report_rows else None,
+                            reports_checked=True,
+                            report_rows=tuple(report_rows),
+                            market_orders=nation_orders,
+                            stockpiles=stockpiles,
+                        ),
+                        overview_html,
+                    )
+                )
+            except AuthenticationError:
+                raise
+            except MonitorError as error:
+                result.append(NationSnapshot(nation, Snapshot(0, 0, None), skipped=str(error)))
+        return tuple(result)
+
     def snapshot(
         self,
         include_market: bool = True,
         stockpiles: Optional[Stockpiles] = None,
+        overview_for: FrozenSet[int] = frozenset(),
     ) -> Snapshot:
+        """Read one poll.
+
+        On a multi-nation account every nation is visited (see ``_nation_snapshots``), and
+        ``overview_for`` names the nations whose overview page the sheet sync will want, so it
+        is read during the visit instead of costing a second switch later. A watched market
+        reads every nation's overview regardless, since each nation's reserves need its stock.
+        """
         navigation_html = self._open("index.php")
         if not is_logged_in(navigation_html):
             self.login()
@@ -1832,6 +2012,16 @@ class ClopClient:
         latest_news = parse_latest_news(news_html)
         if "<h3>News</h3>" in news_html and "No news yet." not in news_html and latest_news is None:
             raise MonitorError("The newest news entry could not be parsed")
+        if self.switchable:
+            # include_market=False is the refresh after a dismissed dialog, which re-reads only
+            # the counts; check_and_notify keeps every nation's half from the poll that alerted.
+            return Snapshot(
+                user_messages=user_messages,
+                alliance_messages=alliance_messages,
+                latest_news=latest_news,
+                fourchan_post=self._latest_fourchan_post(),
+                nations=self._nation_snapshots(overview_for) if include_market else (),
+            )
         reports_html = self._open("reports.php")
         if not is_logged_in(reports_html) or "<h3>Reports</h3>" not in reports_html:
             raise MonitorError("The authenticated reports page could not be read")
@@ -1899,10 +2089,13 @@ def market_order_alerts(
     order: MarketOrder,
     good: WatchedGood,
     stockpiles: Optional[Stockpiles] = None,
+    own_nations: FrozenSet[str] = frozenset(),
 ) -> bool:
     """Whether one buy order raises an alert under this good's settings.
 
-    The active nation is always ignored, ahead of every configurable override. ``never`` is
+    The active nation is always ignored, ahead of every configurable override, and so is every
+    other nation on the account, named in ``own_nations``: selling to yourself is a transfer
+    you would make in the game, not a buyer to be told about. ``never`` is
     otherwise absolute, which is what "never alert on" says; ``always`` then beats both
     relation checks, so both of them off with a populated always reads as "only these nations,
     whoever they are". The two relation checks are independent, so a buyer who is both a
@@ -1921,6 +2114,8 @@ def market_order_alerts(
         and stockpiles.nation_name is not None
         and order.nation_name.casefold() == stockpiles.nation_name.casefold()
     ):
+        return False
+    if order.nation_name.casefold() in {name.casefold() for name in own_nations}:
         return False
     if matches_any_pattern(order.nation_name, good.never):
         return False
@@ -1966,6 +2161,7 @@ def build_alerts(
     previous: Optional[Snapshot],
     current: Snapshot,
     settings: AlertCategorySettings = AlertCategorySettings(),
+    own_nations: FrozenSet[str] = frozenset(),
 ) -> List[str]:
     alerts: List[str] = []
     if settings.user_messages and current.user_messages > 0:
@@ -2004,12 +2200,33 @@ def build_alerts(
             f"wants {order.amount:,} at {order.price:,} bits each"
             for order in current.market_orders
             if order.good.casefold() == watched
-            and market_order_alerts(order, good, current.stockpiles)
+            and market_order_alerts(order, good, current.stockpiles, own_nations)
         ]
         if lines:
             # No marketplace link: the heading already says where to go, and the URL was one
             # more line of noise in a dialog that may be carrying several of these blocks.
             alerts.append(f"Buy orders for {good.name}:\n" + "\n".join(lines))
+    # Each nation of a multi-nation account is judged as a one-nation account would be, with
+    # the login-wide categories muted because the outer snapshot has already reported them.
+    # Its alerts are named for it: "a tick happened" means nothing without saying where.
+    if current.nations:
+        account_nations = own_nations | frozenset(entry.nation.name for entry in current.nations)
+        previous_nations = (
+            {entry.nation.nation_id: entry.snapshot for entry in previous.nations}
+            if previous is not None
+            else {}
+        )
+        per_nation = replace(settings, user_messages=False, alliance_messages=False, news=False)
+        for entry in current.nations:
+            if entry.skipped is not None:
+                continue
+            for alert in build_alerts(
+                previous_nations.get(entry.nation.nation_id),
+                entry.snapshot,
+                per_nation,
+                account_nations,
+            ):
+                alerts.append(f"{entry.nation.name}: {alert}")
     if (
         current.fourchan_post is not None
         and previous is not None
@@ -2485,13 +2702,34 @@ def check_and_notify(
     alert_settings: AlertCategorySettings = AlertCategorySettings(),
     persist_state: bool = True,
     stockpiles: Optional[Stockpiles] = None,
+    overview_for: FrozenSet[int] = frozenset(),
 ) -> Tuple[Snapshot, bool]:
     """Poll once, pausing for a Windows dialog and refreshing state after dismissal."""
-    current = (
-        client.snapshot(stockpiles=stockpiles)
-        if stockpiles is not None
-        else client.snapshot()
-    )
+    if overview_for:
+        current = client.snapshot(overview_for=overview_for)
+    elif stockpiles is not None:
+        current = client.snapshot(stockpiles=stockpiles)
+    else:
+        current = client.snapshot()
+    skipped = [entry for entry in current.nations if entry.skipped is not None]
+    if skipped:
+        # Nothing was read for a skipped nation, so its marker stays at what the last good
+        # read saw; adopting the empty snapshot would silently re-baseline it and lose every
+        # report that lands before it is next read.
+        earlier = (
+            {entry.nation.nation_id: entry.snapshot for entry in previous.nations}
+            if previous is not None
+            else {}
+        )
+        current = replace(
+            current,
+            nations=tuple(
+                replace(entry, snapshot=earlier.get(entry.nation.nation_id, entry.snapshot))
+                if entry.skipped is not None
+                else entry
+                for entry in current.nations
+            ),
+        )
     alerts = build_alerts(previous, current, alert_settings)
     paused_for_alert = False
     if alerts:
@@ -2512,8 +2750,17 @@ def check_and_notify(
                 report_rows=current.report_rows,
                 fourchan_post=current.fourchan_post,
                 stockpiles=current.stockpiles,
+                nations=current.nations,
             )
             print("Alert dismissed; refreshed the monitoring snapshot.", flush=True)
+    if skipped:
+        notifier.notify_failure(
+            "Nothing was read or written for "
+            + ", ".join(entry.nation.name for entry in skipped)
+            + " this check, so no sheet tab was touched for it:\n\n"
+            + "\n".join(f"- {entry.nation.name}: {entry.skipped}" for entry in skipped)
+            + "\n\nThe other nations were checked as usual, and the next check tries again."
+        )
     if persist_state:
         save_snapshot(state_path, current)
     return current, paused_for_alert
@@ -2660,6 +2907,7 @@ def reload_settings(
         # monitor keeps POSTing once a poll for goods nobody watches.
         client.market_goods = ()
         client.alliance_id = None
+        client.alliance_ids = {}
     if thread_changed:
         client.fourchan_thread = reloaded.fourchan_thread
         # The thread's current last post becomes the baseline, exactly as at startup, so the

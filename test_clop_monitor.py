@@ -3230,7 +3230,7 @@ def market_responder(rows_by_resource_id):
     return serve
 
 
-def market_overview(amounts=None, ticks=None, used=None):
+def market_overview(amounts=None, ticks=None, used=None, nation="Our Nation", header=AUTHENTICATED_HEADER):
     """A valid overview carrying enough stock data for market-reserve decisions."""
     amounts = amounts or {"Machinery Parts": 100, "Oil": 100, "Apples": 100}
     ticks = ticks or {}
@@ -3242,8 +3242,8 @@ def market_overview(amounts=None, ticks=None, used=None):
         for name, amount in amounts.items()
     )
     return (
-        AUTHENTICATED_HEADER
-        + "<center><h3>Our Nation</h3></center>"
+        header
+        + f"<center><h3>{nation}</h3></center>"
         + '<div class="panel-heading">Resources</div><table>'
         '<tr><td style="text-align: right;">Resource</td><td>Qty</td><td>Generated</td>'
         "<td>Used</td><td>Loss</td><td>Net</td><td>Ticks-Worth</td></tr>"
@@ -5406,14 +5406,20 @@ class OpenTransportFailureTests(unittest.TestCase):
 
 
 
-def switcher_page(selected, nations=((11, "First Nation"), (12, "Second Nation"))):
+TWO_NATIONS = ((11, "First Nation"), (12, "Second Nation"))
+
+#: The header with no pending messages, so a poll's only alerts are the ones a test sets up.
+QUIET_HEADER = AUTHENTICATED_HEADER.replace("(7)", "").replace("(2)", "")
+
+
+def switcher_page(selected, nations=TWO_NATIONS, header=AUTHENTICATED_HEADER):
     """An authenticated page whose header switcher has ``selected`` chosen."""
     options = "".join(
         f'<option value="{nation_id}"{" selected " if nation_id == selected else ""}>{name}</option>'
         for nation_id, name in nations
     )
     return (
-        AUTHENTICATED_HEADER
+        header
         + '<li><a><form action="" method="post"><select name="switchnation_id">'
         + options
         + "</select></form></a></li>"
@@ -5559,6 +5565,219 @@ class NationSwitchingTests(unittest.TestCase):
         self.assertEqual(state["active"], 12)
         self.assertEqual(client.active_nation_id, 12)
         self.assertIn(("login.php", {"username": "user", "password": "password"}), calls)
+
+
+class TwoNationAccount:
+    """A two-nation account served the way the game serves it: one session, one active nation.
+
+    Every page carries the header switcher for the session's current nation, and reports.php and
+    overview.php answer for whichever nation that is. ``reports`` and ``overview_names`` are keyed
+    by nation id; ``lands_on`` makes a switch land somewhere else, as a refused switch would.
+    """
+
+    def __init__(self, reports=None, overview_names=None, lands_on=None, market_rows=None, goods=()):
+        self.state = {"active": 11}
+        self.amounts = {"Gems": 50, "Oil": 100}
+        self.reports = reports or {}
+        self.overview_names = dict(TWO_NATIONS)
+        self.overview_names.update(overview_names or {})
+        self.lands_on = lands_on or {}
+        pages = {
+            "index.php": lambda form: self.chrome(),
+            "news.php?page=1": lambda form: self.chrome() + "<h3>News</h3>No news yet.",
+            "reports.php": lambda form: self.chrome()
+            + reports_page(self.reports.get(self.state["active"], [])),
+            "overview.php": self.overview,
+        }
+        if market_rows is not None:
+            market = market_responder(market_rows)
+            pages["buyermarketplace.php"] = lambda form: self.chrome() + market(form)
+        #: Kept so a test can serve more pages; market_client reads this same dict.
+        self.pages = pages
+        self.client, self.calls = market_client(pages, goods=goods)
+
+    def chrome(self):
+        return switcher_page(self.state["active"], header=QUIET_HEADER)
+
+    def overview(self, form):
+        if form is not None and "switchnation_id" in form:
+            wanted = int(form["switchnation_id"])
+            self.state["active"] = self.lands_on.get(wanted, wanted)
+        return market_overview(
+            self.amounts, nation=self.overview_names[self.state["active"]], header=self.chrome()
+        )
+
+
+class RecordingFailures:
+    """A notifier that records alerts and failures and never blocks."""
+
+    def __init__(self):
+        self.messages = []
+        self.failures = []
+
+    def notify(self, message):
+        self.messages.append(message)
+        return False
+
+    def notify_failure(self, message):
+        self.failures.append(message)
+        return False
+
+
+def nation_markers(snapshot):
+    """{nation id: latest report} for a multi-nation snapshot."""
+    return {n.nation.nation_id: n.snapshot.latest_report for n in snapshot.nations}
+
+
+class MultiNationPollTests(unittest.TestCase):
+    def poll(self, account, previous=None, notifier=None):
+        account.client.discover_nations()
+        notifier = notifier or RecordingFailures()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            current, _ = check_and_notify(account.client, previous, notifier, state)
+            reloaded = load_snapshot(state)
+        return current, notifier, reloaded
+
+    def test_each_nation_is_read_on_its_own_switched_session(self):
+        account = TwoNationAccount(reports={11: ["First's report"], 12: ["Second's report"]})
+        current, notifier, _ = self.poll(account)
+        self.assertEqual(
+            nation_markers(current),
+            {11: ("First's report", "2026-08-17 08:01:00"), 12: ("Second's report", "2026-08-17 08:01:00")},
+        )
+        # The first poll is a baseline, exactly as for one nation.
+        self.assertEqual(notifier.messages, [])
+        switches = [form for path, form in account.calls if form and "switchnation_id" in form]
+        self.assertEqual(switches, [{"switchnation_id": "11"}, {"switchnation_id": "12"}])
+
+    def test_a_new_report_alerts_under_its_nations_name(self):
+        account = TwoNationAccount(reports={11: ["Old"], 12: ["Old"]})
+        baseline, _, _ = self.poll(account)
+        account.reports[12] = ["Raiders took the mine", "Old"]
+        _, notifier, _ = self.poll(account, baseline)
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertTrue(notifier.messages[0].startswith("Second Nation: "))
+        self.assertIn("Raiders took the mine", notifier.messages[0])
+        self.assertNotIn("First Nation", notifier.messages[0])
+
+    def test_markers_survive_the_state_file(self):
+        account = TwoNationAccount(reports={11: ["A"], 12: ["B"]})
+        current, _, reloaded = self.poll(account)
+        self.assertEqual(nation_markers(reloaded), nation_markers(current))
+        self.assertEqual(
+            [n.nation for n in reloaded.nations],
+            [clop_monitor.AccountNation(11, "First Nation"), clop_monitor.AccountNation(12, "Second Nation")],
+        )
+        account.reports[11] = ["Newer", "A"]
+        _, notifier, _ = self.poll(account, reloaded)
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertIn("First Nation: ", notifier.messages[0])
+
+    def test_a_refused_switch_skips_the_nation_and_keeps_its_marker(self):
+        account = TwoNationAccount(reports={11: ["A"], 12: ["B"]})
+        baseline, _, _ = self.poll(account)
+        account.lands_on = {12: 11}
+        account.reports[11] = ["A2", "A"]
+        current, notifier, _ = self.poll(account, baseline)
+        self.assertEqual(len(notifier.failures), 1)
+        self.assertIn("Second Nation", notifier.failures[0])
+        # The other nation is still read and alerted on.
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertIn("First Nation: ", notifier.messages[0])
+        # Nothing was read for the skipped nation, so its marker stays where it was.
+        self.assertEqual(nation_markers(current)[12], nation_markers(baseline)[12])
+
+    def test_an_overview_naming_another_nation_is_never_trusted(self):
+        # The bug this design removes: a page for one nation taken as another's.
+        account = TwoNationAccount(overview_names={12: "First Nation"})
+        account.client.discover_nations()
+        current = account.client.snapshot(overview_for=frozenset({11, 12}))
+        by_id = {n.nation.nation_id: n for n in current.nations}
+        self.assertIsNone(by_id[11].skipped)
+        self.assertIsNotNone(by_id[11].overview_html)
+        self.assertIn("First Nation", by_id[12].skipped)
+        self.assertIsNone(by_id[12].overview_html)
+
+    def test_overview_is_read_only_for_the_nations_that_need_it(self):
+        account = TwoNationAccount()
+        account.client.discover_nations()
+        current = account.client.snapshot(overview_for=frozenset({12}))
+        by_id = {n.nation.nation_id: n for n in current.nations}
+        self.assertIsNone(by_id[11].overview_html)
+        self.assertIsNotNone(by_id[12].overview_html)
+        self.assertEqual(by_id[12].snapshot.stockpiles.nation_name, "Second Nation")
+
+    def test_the_refresh_after_a_dismissal_does_not_walk_the_nations(self):
+        account = TwoNationAccount(reports={11: ["A"], 12: ["B"]})
+        baseline, _, _ = self.poll(account)
+        account.reports[11] = ["A2", "A"]
+
+        class Blocking(RecordingFailures):
+            def notify(self, message):
+                super().notify(message)
+                return True
+
+        account.calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            current, _, _ = self.poll(account, baseline, Blocking())
+        self.assertEqual([path for path, _ in account.calls].count("reports.php"), 2)
+        self.assertEqual(nation_markers(current)[11], ("A2", "2026-08-17 08:02:00"))
+
+    def test_buy_orders_from_the_accounts_own_nations_never_alert(self):
+        account = TwoNationAccount(
+            market_rows={"26": [
+                market_row(12, "Second Nation", "text-info", 5, "900"),
+                market_row(42, "Luna Sueno", "text-info", 5, "900"),
+            ]},
+            goods=(("Gems", 26),),
+        )
+        account.client.discover_nations()
+        settings = AlertCategorySettings(market_goods=(clop_monitor.WatchedGood("Gems"),))
+        notifier = RecordingFailures()
+        with tempfile.TemporaryDirectory() as directory:
+            check_and_notify(
+                account.client, None, notifier, Path(directory) / "s.json", settings, persist_state=False
+            )
+        text = "\n".join(notifier.messages)
+        self.assertIn("Luna Sueno", text)
+        self.assertNotIn("Second Nation (", text)
+        # The order list is the same for every nation on the login, so it is fetched once.
+        posts = [form for path, form in account.calls if path == "buyermarketplace.php" and form]
+        self.assertEqual(len(posts), 1)
+
+    def test_each_nation_judges_alliance_by_its_own_roster(self):
+        orders = (
+            clop_monitor.MarketOrder("Gems", 42, "Ally Of First", 1, 1),
+            clop_monitor.MarketOrder("Gems", 43, "Stranger", 1, 1),
+        )
+        judged = clop_monitor.apply_roster(orders, frozenset({42}))
+        self.assertEqual([o.is_ally for o in judged], [True, False])
+
+    def test_the_preflight_resolves_each_nations_alliance_without_switching(self):
+        account = TwoNationAccount(market_rows={}, goods=())
+        account.pages["viewnation.php?nation_id=11"] = NATION_PAGE
+        account.pages["viewnation.php?nation_id=12"] = (
+            '<h4>Alliance: <a href="viewalliance.php?alliance_id=0">None</a></h4>'
+        )
+        account.client.discover_nations()
+        account.calls.clear()
+        message = account.client.market_preflight((clop_monitor.WatchedGood("Oil"),))
+        self.assertEqual(account.client.alliance_ids, {11: 7, 12: 0})
+        self.assertIn("First Nation in The Best Alliance (#7)", message)
+        self.assertIn("Second Nation in no alliance", message)
+        self.assertFalse([form for _, form in account.calls if form and "switchnation_id" in form])
+
+    def test_alliance_is_judged_against_the_reading_nations_roster(self):
+        account = TwoNationAccount(
+            market_rows={"26": [market_row(13, "Also Mine", "", 5, "900")]}, goods=(("Gems", 26),)
+        )
+        account.pages["viewalliance.php?alliance_id=7"] = ALLIANCE_PAGE
+        account.client.discover_nations()
+        account.client.alliance_ids = {11: 7, 12: 0}
+        current = account.client.snapshot()
+        allies = {n.nation.nation_id: n.snapshot.market_orders[0].is_ally for n in current.nations}
+        self.assertEqual(allies, {11: True, 12: False})
 
 
 if __name__ == "__main__":
