@@ -882,9 +882,65 @@ deployment; the repo holds only its public `/exec` URL. If the deployment is eve
 doc `docs/superpowers/specs/2026-08-23-google-sheets-module-design.md` contains the Apps Script
 source and the redeploy steps — paste it back onto the sheet and replace `EXEC_URL` in `sheets.py`.
 
+### More than one nation on your login
+
+One CLOP login can own several nations, picked with the dropdown in the game's header. The game
+remembers the chosen nation **per login session**, and a fresh login lands on whichever nation the
+database happens to return first. So the monitor never trusts where it landed. Each poll it:
+
+1. reads your nations from that header dropdown (a one-nation account has no dropdown; its nation
+   comes from the empire overview instead);
+2. reads messages, news and 4chan once, because those belong to the login, not to a nation;
+3. for **each nation in turn**, switches the session to it, **checks the dropdown now shows that
+   nation**, and reads its reports and overview. The buy-order list is the same for every nation on
+   a login, so it is fetched once, and each nation's own alliance is applied to it;
+4. writes each nation's numbers to **that nation's** tab.
+
+**It refuses to guess.** If a switch lands on the wrong nation, or overview.php shows a different
+nation's name than the one it switched to, that nation is skipped for the poll with a dialog saying
+so, and **nothing is written to its tab**. The other nations carry on as normal. Report and market
+alerts start with the nation's name (`Second Nation: [TICK HAPPENED ...]`), and buy orders from any of
+your own nations never alert.
+
+With several nations, `CLOP_NATION` is not enough, because one tab name can't say which nation
+it's for. Map them in **`settings.json`** instead, keyed by the **in-game name exactly as the dropdown
+shows it**:
+
+```json
+"nations": {
+  "Le Pone":      { "tab": "LePone(Z)" },
+  "Other Nation": { "tab": "Other", "sheet_url": "https://script.google.com/macros/s/.../exec" },
+  "Alt Nation":   { "sync": false }
+}
+```
+
+| Key | Meaning | If left out |
+|---|---|---|
+| `tab` | The sheet tab, and the name looked up in row 1 of `Dashboard-Stockpile` | The in-game name |
+| `sheet_url` | The Apps Script `/exec` URL of the nation's spreadsheet, for a nation kept in a different spreadsheet (same layout) | `EXEC_URL` in `sheets.py` |
+| `sync` | `false` keeps the nation's alerts but writes no sheet | `true` |
+
+Rules worth knowing:
+
+- **The `nations` section, when present, decides alone**, and `CLOP_NATION` is ignored.
+- **`CLOP_NATION` on its own still works for a one-nation account**, exactly as before. On a
+  multi-nation account it turns sheet sync off with a dialog asking for the `nations` section.
+  Reports and alerts keep working for every nation either way.
+- A nation on your login that the section doesn't list is still watched, but its tab isn't
+  written, and you get a dialog at startup naming it. An entry naming no nation on the login (a
+  typo, usually) gets the same treatment. Give a nation `"sync": false` to say on purpose that it
+  has no sheet.
+- The section reloads like the rest of `settings.json`. A nation founded or lost while the monitor
+  runs is noticed on the next poll, from the header.
+- `settings.example.json` ships the section as `_nations_example`, which does nothing. Rename it to
+  `nations` and edit the names to use it.
+
+The standalone checks (`python .\sheets.py`, `buildings.py`, `stockpiles.py`) still read the single
+tab named by `CLOP_NATION`.
+
 ## Sheet sync
 
-When `CLOP_NATION` is set, the monitor runs one extra step **each poll, after the regular
+When a nation has a tab configured (see the two sections above), the monitor runs one extra step **each poll, after the regular
 alerting**: it fetches `overview.php` once and uses that single page to update three parts of the
 sheet — your **building counts** and your **stockpiles** on your own nation tab, and your **column
 on the alliance-wide `Dashboard-Stockpile` tab**. Nothing on the game is ever changed; this only reads
@@ -944,15 +1000,15 @@ Two consequences worth knowing:
 time" — it stops advancing while nothing changes. That is the more useful of the two claims, and the
 honest one for a value that has not moved in two hours.
 
-Sheet sync is **off** if `CLOP_NATION` is unset, and turns itself off (with one warning) if the tab
-**is genuinely missing**. The monitor's message/news/report alerting is never affected either way.
+Sheet sync is **off** if no tab is configured, and turns itself off for that nation (with one
+warning) if the tab **is genuinely missing**. The monitor's message/news/report alerting is never affected either way.
 
 A tab that is merely *unreachable* is treated completely differently, and the distinction matters:
 
 | At startup the tab check… | Result |
 |---|---|
 | succeeds | Sheet sync on, as normal |
-| says the tab does not exist | Sheet sync **off** for the session — fix `CLOP_NATION` or the sheet and restart |
+| says the tab does not exist | Sheet sync **off** for that nation for the session — fix `CLOP_NATION` / the `nations` section or the sheet and restart |
 | cannot reach Google at all (timeout, outage) | Sheet sync **stays on**; you get one dialog, and the first poll checks again |
 
 That last row used to behave like the middle one, and it was the worst bug in this area: a single

@@ -272,5 +272,11 @@
   "fourchan": {
     "thread_url": "https://boards.4chan.org/mlp/thread/43454282/clop-financial-crisis-edition",
     "_thread_url_help": "Set thread_url to a thread you want watched, for example https://boards.4chan.org/mlp/thread/43454282/clop-financial-crisis-edition. Leave it null to disable thread monitoring; threads archive, so a URL left here goes stale."
+  },
+  "_nations_help": "For a login with more than one nation. Rename _nations_example below to nations to switch it on; while it is named _nations_example it does nothing, and CLOP_NATION in .env names the one tab of a one-nation login. Each key is an in-game nation name exactly as the game's nation dropdown shows it. tab is the sheet tab (default: the in-game name), sheet_url the Apps Script /exec URL of that nation's spreadsheet (default: the shared sheet), and sync false watches the nation's reports and market without writing any sheet. Once nations is present it alone decides, and CLOP_NATION is ignored. Every nation on the login should be listed: one that is not still gets alerts, but its tab is not written and you are told at startup.",
+  "_nations_example": {
+    "Le Pone": { "tab": "LePone(Z)" },
+    "Other Nation": { "tab": "Other", "sheet_url": "https://script.google.com/macros/s/REPLACE_ME/exec" },
+    "Alt Nation": { "sync": false }
   }
 }

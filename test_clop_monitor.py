@@ -6018,6 +6018,12 @@ class NationSettingsTests(unittest.TestCase):
             with self.subTest(nations=nations), self.assertRaises(MonitorError):
                 self.load(nations)
 
+    def test_the_shipped_example_is_inert_and_valid_once_renamed(self):
+        example = shipped_example()
+        self.assertNotIn("nations", example)
+        settings = self.load(example["_nations_example"])
+        self.assertEqual([name for name, _ in settings.nations], ["Le Pone", "Other Nation", "Alt Nation"])
+
     def test_a_nations_edit_reloads_as_a_nations_change(self):
         before = clop_monitor.MonitorSettings()
         after = clop_monitor.MonitorSettings(nations=(("A", clop_monitor.NationSettings()),))

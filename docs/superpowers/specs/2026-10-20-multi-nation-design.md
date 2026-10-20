@@ -80,11 +80,30 @@ nation it meant is the bug this design removes.
 
 ## State
 
-`.state/clop-monitor.json` keeps per-login fields at top level and gains a `nations` object keyed
-by nation id holding each nation's report marker. A state file from before this change is read
-as the baseline of whichever nation the old session was on; since that nation is unknown, the
-first poll treats every nation's reports as a fresh baseline (no alert storm, no false alerts).
-The sheet fingerprints are in memory only, per nation, as today.
+A one-nation account keeps today's flat `Snapshot` and state file unchanged, so its report marker
+carries over with nothing lost. A multi-nation account's `Snapshot` carries one `NationSnapshot`
+per nation (its reports, market view, stockpile and overview page), and `.state/clop-monitor.json`
+gains a `nations` list holding each nation's id, name and report marker. A state file from before
+this change has no `nations` list and loads as before. On a multi-nation account its flat marker
+belongs to whichever nation the old session happened to be on, so it is not reused: the first poll
+is a fresh baseline for every nation (no alert storm, no false alerts). A skipped nation keeps its
+previous marker. The sheet fingerprints are in memory only, per nation.
+
+## Discovered during implementation
+
+- The buyer market colours friends and enemies by user (`buyermarketplace.php:65`, embargoes by
+  `user_id`), so the order list is identical for every nation on a login. It is fetched once per
+  poll, and each nation's alliance roster is applied afterwards (`apply_roster`). Only alliance
+  differs between an account's nations; each nation's alliance is resolved by the market preflight
+  from `viewnation.php`, which needs no switching.
+- There are three independent checks that a page belongs to the nation expected: the header's
+  selected option after the switch, the same on `reports.php`, and the nation name overview.php
+  prints (`require_page_nation`, also applied inside `sync_sheet_step` via `expected_nation`).
+- An absent `nations` section is not listed among "settings using defaults": it means
+  `CLOP_NATION` names the tab, which is the normal one-nation setup.
+- `settings.example.json` ships the section as `_nations_example`, which is inert, because a live
+  example with made-up names would turn on the `nations` rules (and ignore `CLOP_NATION`) for anyone
+  who copied the file.
 
 ## Testing
 
