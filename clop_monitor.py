@@ -150,11 +150,36 @@ class FourChanThreadSettings:
 
 
 @dataclass(frozen=True)
+class NationSettings:
+    """Where one nation's numbers go, from the nations section of settings.json."""
+
+    #: The sheet tab, which is also the name looked up in row 1 of the Dashboard tab. None
+    #: means the nation's in-game name.
+    tab: Optional[str] = None
+    #: The Apps Script /exec URL of the nation's spreadsheet. None means sheets.EXEC_URL.
+    sheet_url: Optional[str] = None
+    #: False watches the nation's reports and market without writing any sheet.
+    sync: bool = True
+
+
+@dataclass(frozen=True)
+class SheetTarget:
+    """One nation's sheet sync: which tab of which spreadsheet its numbers are written to."""
+
+    nation: AccountNation
+    tab: str
+    sheet_url: str
+
+
+@dataclass(frozen=True)
 class MonitorSettings:
     alerts: AlertCategorySettings = AlertCategorySettings()
     sound: SoundSettings = SoundSettings()
     cache: CacheSettings = CacheSettings()
     fourchan_thread: Optional[FourChanThreadSettings] = None
+    #: (in-game nation name, its settings) in file order; None when the section is absent,
+    #: which leaves CLOP_NATION to name the one tab of a one-nation account.
+    nations: Optional[Tuple[Tuple[str, NationSettings], ...]] = None
     #: Dotted names of the settings that the file left out, in the order they are documented.
     defaults_used: Tuple[str, ...] = ()
     file_found: bool = True
@@ -336,6 +361,129 @@ def load_market_goods(
     return tuple(market_goods)
 
 
+def load_nations(value: Dict[str, object]) -> Optional[Tuple[Tuple[str, NationSettings], ...]]:
+    """The nations section: each in-game nation name mapped to its tab and spreadsheet.
+
+    Keys starting with an underscore are help text, as everywhere else in the file. An unknown
+    key inside an entry is refused rather than ignored, because a misspelt "tab" would quietly
+    send that nation's numbers to a tab named after the nation instead.
+
+    An absent section is not reported as a default: it means CLOP_NATION names the tab, which
+    is the normal setup for a one-nation account, and plan_sheet_sync speaks up if it is not.
+    """
+    if "nations" not in value:
+        return None
+    section = value["nations"]
+    if not isinstance(section, dict):
+        raise MonitorError("The nations setting must be a JSON object")
+    result: List[Tuple[str, NationSettings]] = []
+    for name, entry in section.items():
+        if name.startswith("_"):
+            continue
+        if not name.strip():
+            raise MonitorError("A nations entry has an empty nation name")
+        if not isinstance(entry, dict):
+            raise MonitorError(f"nations entry {name!r} must be a JSON object")
+        unknown = sorted(key for key in entry if not key.startswith("_") and key not in {"tab", "sheet_url", "sync"})
+        if unknown:
+            raise MonitorError(
+                f"nations entry {name!r} has unknown setting(s) {', '.join(unknown)}; "
+                "the settings are tab, sheet_url and sync"
+            )
+        tab = entry.get("tab")
+        if tab is not None and (not isinstance(tab, str) or not tab.strip()):
+            raise MonitorError(f"nations entry {name!r}: tab must be a non-empty string")
+        sheet_url = entry.get("sheet_url")
+        if sheet_url is not None and (
+            not isinstance(sheet_url, str) or not sheet_url.strip().startswith("https://")
+        ):
+            raise MonitorError(f"nations entry {name!r}: sheet_url must be an https:// URL")
+        sync = entry.get("sync", True)
+        if not isinstance(sync, bool):
+            raise MonitorError(f"nations entry {name!r}: sync must be true or false")
+        result.append(
+            (
+                name,
+                NationSettings(
+                    tab=tab.strip() if tab is not None else None,
+                    sheet_url=sheet_url.strip() if sheet_url is not None else None,
+                    sync=sync,
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def plan_sheet_sync(
+    nations: Sequence[AccountNation],
+    configured: Optional[Tuple[Tuple[str, NationSettings], ...]],
+    env_nation: Optional[str],
+    default_url: str,
+) -> Tuple[List[SheetTarget], List[str]]:
+    """Which nations' sheets to sync and where, plus every warning the person must see.
+
+    Pure, so every rule is testable without a sheet: the caller turns the warnings into one
+    startup dialog and checks each target's tab exists.
+
+    With a nations section, it alone decides and CLOP_NATION is ignored. Without one,
+    CLOP_NATION keeps its old meaning, but only on a one-nation account: on a multi-nation
+    account it cannot say which nation it is for, and guessing is exactly the bug that wrote one
+    nation's numbers over another's tab.
+    """
+    account = ", ".join(nation.name for nation in nations)
+    if configured is None:
+        if not env_nation:
+            return [], [
+                "Sheet sync is OFF, so no nation tab will be updated at all: no building counts, "
+                "no stockpile numbers, and no W10 timestamp.\n\n"
+                "Nothing says which tab to write. Add a \"nations\" section to settings.json "
+                "mapping each nation to its tab (see settings.example.json), or, for a one-nation "
+                "account, set CLOP_NATION in .env to the exact name of your tab, then restart "
+                "the monitor.\n\n"
+                "Everything else (messages, news, reports) keeps working meanwhile."
+            ]
+        if len(nations) != 1:
+            return [], [
+                f"Sheet sync is OFF: CLOP_NATION={env_nation} names one sheet tab, but this "
+                f"account has {len(nations)} nations ({account}), so the monitor cannot tell "
+                "which nation it belongs to.\n\n"
+                "Add a \"nations\" section to settings.json mapping each nation to its tab (see "
+                "settings.example.json). Reports and alerts keep working for every nation "
+                "meanwhile."
+            ]
+        return [SheetTarget(nations[0], env_nation, default_url)], []
+
+    by_name = dict(configured)
+    targets: List[SheetTarget] = []
+    unlisted: List[str] = []
+    for nation in nations:
+        entry = by_name.get(nation.name)
+        if entry is None:
+            unlisted.append(nation.name)
+        elif entry.sync:
+            targets.append(
+                SheetTarget(nation, entry.tab or nation.name, entry.sheet_url or default_url)
+            )
+    warnings: List[str] = []
+    if unlisted:
+        warnings.append(
+            "These nations are on the account but not in the nations section of settings.json, "
+            "so their sheet tabs are not updated: " + ", ".join(unlisted) + ".\n\n"
+            "Their reports are still watched. Add each one to the section, or give it "
+            "\"sync\": false to say on purpose that it has no sheet."
+        )
+    known = {nation.name for nation in nations}
+    unknown = [name for name, _ in configured if name not in known]
+    if unknown:
+        warnings.append(
+            "These nations entries in settings.json name no nation on this account, so they do "
+            "nothing: " + ", ".join(unknown) + ".\n\n"
+            f"The account's nations are: {account}. Names must match the game's nation "
+            "switcher exactly."
+        )
+    return targets, warnings
+
+
 def load_settings(path: Path) -> MonitorSettings:
     """Read the optional settings file; every absent key falls back to a built-in default.
 
@@ -461,11 +609,14 @@ def load_settings(path: Path) -> MonitorSettings:
             raise MonitorError("4chan thread_url must be null or a non-empty string")
         fourchan_thread = parse_fourchan_thread_url(raw_thread_url.strip())
 
+    nations = load_nations(value)
+
     return MonitorSettings(
         alerts=alerts,
         sound=sound,
         cache=cache,
         fourchan_thread=fourchan_thread,
+        nations=nations,
         defaults_used=tuple(defaults_used),
         file_found=file_found,
     )
@@ -2797,6 +2948,8 @@ def settings_changes(previous: MonitorSettings, current: MonitorSettings) -> Tup
         changes.append("cache")
     if previous.fourchan_thread != current.fourchan_thread:
         changes.append("fourchan.thread_url")
+    if previous.nations != current.nations:
+        changes.append("nations")
     return tuple(changes)
 
 

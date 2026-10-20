@@ -3992,6 +3992,7 @@ class SettingsChangeCompletenessTests(unittest.TestCase):
         "fourchan_thread": parse_fourchan_thread_url(
             "https://boards.4chan.org/mlp/thread/1"
         ),
+        "nations": (("Le Pone", clop_monitor.NationSettings(tab="LePone(Z)")),),
     }
 
     #: Fields deliberately left out of the comparison, and why.
@@ -5778,6 +5779,120 @@ class MultiNationPollTests(unittest.TestCase):
         current = account.client.snapshot()
         allies = {n.nation.nation_id: n.snapshot.market_orders[0].is_ally for n in current.nations}
         self.assertEqual(allies, {11: True, 12: False})
+
+
+class NationSettingsTests(unittest.TestCase):
+    def load(self, nations):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({"sound": {"wav_path": None}, "nations": nations}), encoding="utf-8")
+            return load_settings(path)
+
+    def test_an_absent_section_is_none_and_not_called_a_default(self):
+        # Absent means "CLOP_NATION names the tab", the normal one-nation setup.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text("{}", encoding="utf-8")
+            settings = load_settings(path)
+        self.assertIsNone(settings.nations)
+        self.assertNotIn("nations", settings.defaults_used)
+
+    def test_entries_load_in_file_order_with_defaults(self):
+        settings = self.load({
+            "_help": "ignored",
+            "Le Pone": {"tab": "LePone(Z)"},
+            "Other Nation": {"sheet_url": "https://script.google.com/macros/s/x/exec", "_tab_help": "x"},
+            "Alt Nation": {"sync": False},
+        })
+        self.assertEqual(
+            settings.nations,
+            (
+                ("Le Pone", clop_monitor.NationSettings(tab="LePone(Z)")),
+                ("Other Nation", clop_monitor.NationSettings(sheet_url="https://script.google.com/macros/s/x/exec")),
+                ("Alt Nation", clop_monitor.NationSettings(sync=False)),
+            ),
+        )
+
+    def test_bad_values_are_refused(self):
+        for nations in (
+            [],
+            {"A": "LePone(Z)"},
+            {"A": {"tab": ""}},
+            {"A": {"tab": 5}},
+            {"A": {"sync": "no"}},
+            {"A": {"sheet_url": "http://script.google.com/x"}},
+            {"A": {"tabs": "typo"}},
+            {"": {}},
+        ):
+            with self.subTest(nations=nations), self.assertRaises(MonitorError):
+                self.load(nations)
+
+    def test_a_nations_edit_reloads_as_a_nations_change(self):
+        before = clop_monitor.MonitorSettings()
+        after = clop_monitor.MonitorSettings(nations=(("A", clop_monitor.NationSettings()),))
+        self.assertEqual(clop_monitor.settings_changes(before, after), ("nations",))
+
+
+class SheetSyncPlanTests(unittest.TestCase):
+    ONE = (clop_monitor.AccountNation(11, "Le Pone"),)
+    TWO = ONE + (clop_monitor.AccountNation(12, "Other Nation"),)
+    URL = "https://default/exec"
+
+    def plan(self, nations, configured=None, env=None):
+        return clop_monitor.plan_sheet_sync(nations, configured, env, self.URL)
+
+    @staticmethod
+    def targets(plan):
+        return [(t.nation.nation_id, t.tab, t.sheet_url) for t in plan[0]]
+
+    def test_clop_nation_still_works_for_a_one_nation_account(self):
+        plan = self.plan(self.ONE, env="LePone(Z)")
+        self.assertEqual(self.targets(plan), [(11, "LePone(Z)", self.URL)])
+        self.assertEqual(plan[1], [])
+
+    def test_clop_nation_alone_is_refused_on_a_multi_nation_account(self):
+        # Guessing which nation it meant is the bug.
+        plan = self.plan(self.TWO, env="LePone(Z)")
+        self.assertEqual(plan[0], [])
+        self.assertIn("nations", plan[1][0])
+        self.assertIn("Other Nation", plan[1][0])
+
+    def test_nothing_configured_turns_sync_off_with_a_warning(self):
+        plan = self.plan(self.ONE)
+        self.assertEqual(plan[0], [])
+        self.assertIn("CLOP_NATION", plan[1][0])
+
+    def test_the_section_maps_each_nation_with_defaults(self):
+        configured = (
+            ("Le Pone", clop_monitor.NationSettings(tab="LePone(Z)")),
+            ("Other Nation", clop_monitor.NationSettings(sheet_url="https://other/exec")),
+        )
+        plan = self.plan(self.TWO, configured, env="ignored")
+        self.assertEqual(
+            self.targets(plan),
+            [(11, "LePone(Z)", self.URL), (12, "Other Nation", "https://other/exec")],
+        )
+        self.assertEqual(plan[1], [])
+
+    def test_sync_false_watches_without_a_target_or_a_warning(self):
+        configured = (
+            ("Le Pone", clop_monitor.NationSettings()),
+            ("Other Nation", clop_monitor.NationSettings(sync=False)),
+        )
+        plan = self.plan(self.TWO, configured)
+        self.assertEqual(self.targets(plan), [(11, "Le Pone", self.URL)])
+        self.assertEqual(plan[1], [])
+
+    def test_an_unlisted_nation_and_an_unknown_entry_are_both_reported(self):
+        configured = (
+            ("Le Pone", clop_monitor.NationSettings()),
+            ("Le Poen", clop_monitor.NationSettings()),
+        )
+        plan = self.plan(self.TWO, configured)
+        self.assertEqual(self.targets(plan), [(11, "Le Pone", self.URL)])
+        text = "\n".join(plan[1])
+        self.assertIn("Other Nation", text)
+        self.assertIn("Le Poen", text)
 
 
 if __name__ == "__main__":
