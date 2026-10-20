@@ -56,6 +56,18 @@ class ArchivedThreadError(MonitorError):
     """The configured 4chan thread can no longer receive new posts."""
 
 
+class NationSwitchError(MonitorError):
+    """The session did not end up on the nation it was switched to."""
+
+
+@dataclass(frozen=True)
+class AccountNation:
+    """One nation on the logged-in account, as the game's nation switcher names it."""
+
+    nation_id: int
+    name: str
+
+
 @dataclass(frozen=True)
 class WatchedGood:
     """One good's buyer's-market watch.
@@ -845,12 +857,14 @@ def parse_current_nation_id(html: str) -> Optional[int]:
 
 
 class ButtonValueParser(HTMLParser):
-    """The values of every button with a given name."""
+    """The values of every button with a given name, and the text each one shows."""
 
     def __init__(self, name: str) -> None:
         super().__init__(convert_charrefs=True)
         self.name = name.lower()
         self.values: List[str] = []
+        self.texts: List[str] = []
+        self._parts: Optional[List[str]] = None
 
     def handle_starttag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
         if tag.lower() != "button":
@@ -858,13 +872,45 @@ class ButtonValueParser(HTMLParser):
         attributes = dict(attrs)
         if (attributes.get("name") or "").lower() == self.name:
             self.values.append(attributes.get("value") or "")
+            self._parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._parts is not None:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "button" and self._parts is not None:
+            self.texts.append(normalize_text(self._parts))
+            self._parts = None
 
 
 def parse_empire_nation_ids(html: str) -> List[int]:
     """Every nation on the account, from the empire overview's switch buttons."""
+    return [nation.nation_id for nation in parse_empire_nations(html)]
+
+
+def parse_empire_nations(html: str) -> List[AccountNation]:
+    """Every nation on the account with its name, from the empire overview's switch buttons."""
     parser = ButtonValueParser("switchnation_id")
     parser.feed(html)
-    return [int(value) for value in parser.values if value.isdigit()]
+    return [
+        AccountNation(int(value), text)
+        for value, text in zip(parser.values, parser.texts)
+        if value.isdigit()
+    ]
+
+
+def parse_header_nations(html: str) -> List[AccountNation]:
+    """Every nation on the account, from the header's nation switcher.
+
+    header.php renders the switcher only for an account with more than one nation, so an
+    empty list means a one-nation account rather than an unreadable page.
+    """
+    return [
+        AccountNation(int(value), text)
+        for value, text, _ in parse_select_options(html, "switchnation_id")
+        if value.isdigit()
+    ]
 
 
 def _links(html: str) -> List[Tuple[str, str]]:
@@ -1428,6 +1474,15 @@ class ClopClient:
         #: The zero comes from the game: viewnation.php:23 renders the alliance link even for
         #: a nation in no alliance, pointing it at alliance 0.
         self.alliance_id: Optional[int] = None
+        #: Every nation on the account, filled in by discover_nations.
+        self.nations: Tuple[AccountNation, ...] = ()
+        #: Whether the header has a nation switcher, which header.php renders only for an
+        #: account with more than one nation. A one-nation account has nothing to switch.
+        self.switchable = False
+        #: The nation this client has put its session on. A login lands wherever the game
+        #: decides (backend_login.php:57 takes the first row, unordered), so login() switches
+        #: back to this one before anything else is read.
+        self.active_nation_id: Optional[int] = None
         self.cookies = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
         self.opener.addheaders = [("User-Agent", "CLOP-notification-monitor/0.1")]
@@ -1696,7 +1751,62 @@ class ClopClient:
         )
         if not is_logged_in(html):
             raise AuthenticationError("Login failed; check the credentials or the hosted login flow")
+        if self.switchable and self.active_nation_id is not None:
+            # The response to the switch carries the same header counts the login page does,
+            # so callers reading pending counts off the returned page are unaffected.
+            html = self._switch_to(self.active_nation_id, relogin=False)
         return html
+
+    def discover_nations(self) -> Tuple[AccountNation, ...]:
+        """Find every nation on the account and record whether the session can switch.
+
+        The header switcher lists them when there is more than one. Without it the account
+        has one nation, which only the empire overview names.
+        """
+        html = self._open("index.php")
+        if not is_logged_in(html):
+            html = self.login()
+        nations = parse_header_nations(html)
+        switchable = bool(nations)
+        if not nations:
+            nations = parse_empire_nations(self._open("empireoverview.php"))
+            if len(nations) != 1:
+                raise MonitorError(
+                    "Could not identify the account's nations: the header has no nation "
+                    f"switcher and the empire overview lists {len(nations)} nations"
+                )
+        self.nations = tuple(nations)
+        self.switchable = switchable
+        return self.nations
+
+    def _switch_to(self, nation_id: int, relogin: bool = True) -> str:
+        """Move the session to ``nation_id`` and prove it moved.
+
+        Only ``switchnation_id`` is posted. allfunctions.php handles it on every page and then
+        clears $_POST, so none of overview.php's state-changing actions can run off it; this
+        is the same request the empire overview's own buttons send.
+        """
+        html = self._open("overview.php", {"switchnation_id": str(nation_id)})
+        if not is_logged_in(html):
+            if not relogin:
+                raise AuthenticationError("The session was not retained after login")
+            # A dropped session. Logging in switches back by itself once active_nation_id
+            # names the nation wanted, through the relogin=False branch above.
+            self.active_nation_id = nation_id
+            return self.login()
+        landed = parse_current_nation_id(html)
+        if landed != nation_id:
+            where = "no nation" if landed is None else f"nation #{landed}"
+            raise NationSwitchError(
+                f"Switching to nation #{nation_id} left the session on {where}"
+            )
+        return html
+
+    def select_nation(self, nation: AccountNation) -> None:
+        """Put the session on ``nation`` before anything is read for it."""
+        if self.switchable:
+            self._switch_to(nation.nation_id)
+        self.active_nation_id = nation.nation_id
 
     def snapshot(
         self,

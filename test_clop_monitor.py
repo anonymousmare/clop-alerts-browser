@@ -5405,5 +5405,161 @@ class OpenTransportFailureTests(unittest.TestCase):
         self.assertIn("Could not reach", str(caught.exception))
 
 
+
+def switcher_page(selected, nations=((11, "First Nation"), (12, "Second Nation"))):
+    """An authenticated page whose header switcher has ``selected`` chosen."""
+    options = "".join(
+        f'<option value="{nation_id}"{" selected " if nation_id == selected else ""}>{name}</option>'
+        for nation_id, name in nations
+    )
+    return (
+        AUTHENTICATED_HEADER
+        + '<li><a><form action="" method="post"><select name="switchnation_id">'
+        + options
+        + "</select></form></a></li>"
+    )
+
+
+def switching_responder(state, nations=((11, "First Nation"), (12, "Second Nation")), lands_on=None):
+    """overview.php as the game serves it: a switchnation_id POST moves the session's nation.
+
+    ``lands_on`` overrides where a switch actually lands, to stand in for the game refusing it.
+    """
+
+    def respond(form):
+        if form is not None and "switchnation_id" in form:
+            state["active"] = lands_on if lands_on is not None else int(form["switchnation_id"])
+        return switcher_page(state["active"], nations)
+
+    return respond
+
+
+class AccountNationParsingTests(unittest.TestCase):
+    def test_the_header_switcher_lists_every_nation_in_order(self):
+        self.assertEqual(
+            clop_monitor.parse_header_nations(MULTI_NATION_HEADER),
+            [
+                clop_monitor.AccountNation(11, "First Nation"),
+                clop_monitor.AccountNation(12, "Second Nation"),
+            ],
+        )
+
+    def test_a_header_without_a_switcher_lists_no_nations(self):
+        self.assertEqual(clop_monitor.parse_header_nations(AUTHENTICATED_HEADER), [])
+
+    def test_the_market_selector_is_not_mistaken_for_nations(self):
+        self.assertEqual(
+            clop_monitor.parse_header_nations(MARKET_FORM + MULTI_NATION_HEADER)[0].nation_id, 11
+        )
+
+    def test_the_empire_overview_names_each_nation(self):
+        self.assertEqual(
+            clop_monitor.parse_empire_nations(SINGLE_NATION_EMPIRE_OVERVIEW),
+            [clop_monitor.AccountNation(12, "Only Nation")],
+        )
+        self.assertEqual(
+            [n.name for n in clop_monitor.parse_empire_nations(EMPIRE_OVERVIEW)],
+            ["First Nation", "Second Nation", "Third Nation"],
+        )
+
+
+class NationSwitchingTests(unittest.TestCase):
+    def multi_client(self, lands_on=None, active=11):
+        state = {"active": active}
+        responder = switching_responder(state, lands_on=lands_on)
+        client, calls = market_client(
+            {"index.php": lambda form: responder(None), "overview.php": responder}, goods=()
+        )
+        return client, calls, state
+
+    def test_a_header_switcher_makes_the_account_switchable(self):
+        client, _, _ = self.multi_client()
+        nations = client.discover_nations()
+        self.assertTrue(client.switchable)
+        self.assertEqual([n.nation_id for n in nations], [11, 12])
+        self.assertEqual(client.nations, tuple(nations))
+
+    def test_a_one_nation_account_is_read_from_the_empire_overview(self):
+        client, _ = market_client(
+            {"index.php": AUTHENTICATED_HEADER, "empireoverview.php": SINGLE_NATION_EMPIRE_OVERVIEW},
+            goods=(),
+        )
+        self.assertEqual(
+            client.discover_nations(), (clop_monitor.AccountNation(12, "Only Nation"),)
+        )
+        self.assertFalse(client.switchable)
+
+    def test_no_switcher_and_several_empire_buttons_is_an_error(self):
+        client, _ = market_client(
+            {"index.php": AUTHENTICATED_HEADER, "empireoverview.php": EMPIRE_OVERVIEW}, goods=()
+        )
+        with self.assertRaises(MonitorError):
+            client.discover_nations()
+
+    def test_selecting_posts_only_the_switch_and_confirms_it(self):
+        client, calls, state = self.multi_client()
+        client.discover_nations()
+        calls.clear()
+        client.select_nation(client.nations[1])
+        # Only switchnation_id: every other overview.php field changes game state.
+        self.assertEqual(calls, [("overview.php", {"switchnation_id": "12"})])
+        self.assertEqual(state["active"], 12)
+        self.assertEqual(client.active_nation_id, 12)
+
+    def test_a_switch_that_lands_elsewhere_is_refused(self):
+        client, _, _ = self.multi_client(lands_on=11)
+        client.discover_nations()
+        with self.assertRaises(clop_monitor.NationSwitchError):
+            client.select_nation(client.nations[1])
+
+    def test_a_one_nation_account_never_posts_a_switch(self):
+        client, calls = market_client(
+            {"index.php": AUTHENTICATED_HEADER, "empireoverview.php": SINGLE_NATION_EMPIRE_OVERVIEW},
+            goods=(),
+        )
+        client.discover_nations()
+        calls.clear()
+        client.select_nation(client.nations[0])
+        self.assertEqual(calls, [])
+        self.assertEqual(client.active_nation_id, 12)
+
+    def session_pages(self, state):
+        """index, overview and login as the game serves them, with a session that can drop."""
+        responder = switching_responder(state)
+
+        def overview(form):
+            if not state["logged_in"]:
+                return "<a href='login.php'>Log in</a>"
+            return responder(form)
+
+        def login(form):
+            # A fresh session lands on whichever nation the database returns first
+            # (backend_login.php:57), which here is never the one wanted.
+            del form
+            state["logged_in"] = True
+            state["active"] = 11
+            return switcher_page(11)
+
+        return {"index.php": lambda form: responder(None), "overview.php": overview, "login.php": login}
+
+    def test_a_relogin_goes_back_to_the_selected_nation(self):
+        state = {"active": 11, "logged_in": True}
+        client, _ = market_client(self.session_pages(state), goods=())
+        client.discover_nations()
+        client.select_nation(client.nations[1])
+        client.login()
+        self.assertEqual(state["active"], 12)
+
+    def test_a_dropped_session_logs_in_and_still_lands_on_the_nation(self):
+        state = {"active": 11, "logged_in": True}
+        client, calls = market_client(self.session_pages(state), goods=())
+        client.discover_nations()
+        state["logged_in"] = False
+        client.select_nation(client.nations[1])
+        self.assertEqual(state["active"], 12)
+        self.assertEqual(client.active_nation_id, 12)
+        self.assertIn(("login.php", {"username": "user", "password": "password"}), calls)
+
+
 if __name__ == "__main__":
     unittest.main()
