@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      2.0.0
+// @version      2.2.0
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        *://*/*
 // @noframes
@@ -39,6 +39,31 @@
 
 (function () {
   "use strict";
+
+  // Greasemonkey 4 only has the async GM.* API and no value-change listener, which the cross-tab
+  // lock, the one-request-a-second limit and the "are you looking" check all rely on. Say so on
+  // 4clop.org instead of failing on the first storage call.
+  const MISSING = [
+    typeof GM_getValue !== "function" && "GM_getValue",
+    typeof GM_setValue !== "function" && "GM_setValue",
+    typeof GM_xmlhttpRequest !== "function" && "GM_xmlhttpRequest",
+    typeof GM_addValueChangeListener !== "function" && "GM_addValueChangeListener",
+  ].filter(Boolean);
+  if (MISSING.length) {
+    console.warn(`[CLOP Sheet Sync] this userscript manager does not provide ${MISSING.join(", ")}; use Tampermonkey or Violentmonkey.`);
+    if (/(^|\.)4clop\.org$/.test(location.hostname) && document.body) {
+      const note = document.createElement("div");
+      note.id = "clop-sheet-sync-unsupported";
+      note.style.cssText =
+        "position:fixed;right:12px;bottom:12px;z-index:9999;max-width:360px;padding:8px 12px;border-radius:6px;" +
+        "background:#b8322a;color:#fff;font:12px/1.4 sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.5)";
+      note.textContent =
+        "CLOP Sheet Sync can't run in this userscript manager (Greasemonkey 4 is missing " +
+        `${MISSING.join(", ")}). Install Tampermonkey or Violentmonkey and add the script there instead.`;
+      document.body.appendChild(note);
+    }
+    return;
+  }
 
   // ------------------------------------------------------------------------------------------
   // Configuration
@@ -290,6 +315,28 @@
   async function gameRequest(path, form) {
     await paceGame();
     heartbeat();
+    if (ON_GAME) {
+      // On the game's own pages, ask the way the page itself would: same-origin, with your login
+      // cookie guaranteed. A userscript manager's background request may not carry it (Firefox).
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        const response = await fetch(`${GAME_ORIGIN}/${path}`, {
+          method: form ? "POST" : "GET",
+          body: form ? new URLSearchParams(form) : undefined,
+          credentials: "same-origin",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new SyncError(`${path} answered HTTP ${response.status}`);
+        return await response.text();
+      } catch (error) {
+        if (error instanceof SyncError) throw error;
+        throw new SyncError(error.name === "AbortError" ? `4clop.org timed out (${path})` : `could not reach 4clop.org (${path})`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: form ? "POST" : "GET",
@@ -1158,7 +1205,7 @@
 
       const homeHtml = await gameRequest("overview.php");
       if (!isLoggedIn(parseHtml(homeHtml))) {
-        saveRound({ error: null, loggedOut: true });
+        saveRound({ error: null, loggedOut: ON_GAME ? "here" : "offsite" });
         return;
       }
       const home = await readNation(homeHtml);
@@ -1349,7 +1396,11 @@
     let note = null;
     if (!names.length) note = "Not set up -- fill in your sheet names on User Info.";
     else if (round.loggedOut) {
-      note = "Not logged in to 4clop.org.";
+      note = round.loggedOut === "offsite"
+        ? "4clop.org answered as if you were logged out when asked from a tab on another site. If you are " +
+          "logged in, your userscript manager isn't sending your 4clop.org cookie, so syncing only works " +
+          "while a 4clop.org tab is open."
+        : "Not logged in to 4clop.org.";
       level = "bad";
     } else if (round.error) {
       note = `Sync failed: ${round.error}`;
@@ -1389,7 +1440,12 @@
     if (!ON_GAME || !document.body) return;
     const info = summary();
     const busy = syncing();
-    const expanded = GM_getValue("ui.expanded", false);
+    // A failure or a problem you have not seen yet opens the panel by itself; collapsing it marks
+    // that one seen. The key leaves out times, so the same problem does not reopen it every minute.
+    const alertKey = info.level === "bad" || info.level === "warn"
+      ? JSON.stringify([info.note, info.entries.map((e) => [e.name, e.level, e.level === "bad" ? e.line : null, e.details || null])])
+      : "";
+    const expanded = GM_getValue("ui.expanded", false) || (!!alertKey && alertKey !== GM_getValue("ui.seenAlert", ""));
     const signature = JSON.stringify([info, busy, expanded]);
     if (signature === lastRendered && document.getElementById("clop-sheet-sync-badge")) return;
     lastRendered = signature;
@@ -1430,6 +1486,7 @@
     collapse.title = "Collapse";
     collapse.addEventListener("click", () => {
       GM_setValue("ui.expanded", false);
+      GM_setValue("ui.seenAlert", alertKey);
       render();
     });
     head.appendChild(collapse);
@@ -1479,7 +1536,8 @@
       row.dataset.nation = name;
       row.innerHTML = `<td style="padding-right:8px"></td>
         <td><input name="dashboardColumn" class="form-control" style="width:200px;" placeholder="e.g. LePone(Z)" autocomplete="off"/></td>
-        <td><input name="sheetName" class="form-control" style="width:200px;" placeholder="its own tab" autocomplete="off"/></td>`;
+        <td><input name="sheetName" class="form-control" style="width:200px;" placeholder="e.g. LePone(Z)" autocomplete="off"/></td>
+        <td class="clop-guess" style="padding-left:8px;font-size:12px;opacity:.8"></td>`;
       row.cells[0].textContent = name;
       const current = settings[name] || {};
       row.querySelector('[name="dashboardColumn"]').value = current.dashboardColumn || "";
@@ -1498,6 +1556,7 @@
       event.preventDefault();
       save();
       for (const name of names) saveState(name, { digest: null, error: null, problems: [], checkedAt: 0 });
+      checkNames(table).catch((error) => console.warn("[CLOP Sheet Sync] could not check sheet names:", error));
       runRound({ force: true });
     });
     form.syncnow.addEventListener("click", () => {
@@ -1505,6 +1564,72 @@
       runRound({ force: true });
     });
     anchor.parentNode.insertBefore(form, anchor);
+    guessNames(table).catch((error) => console.warn("[CLOP Sheet Sync] could not guess sheet names:", error));
+  }
+
+  /**
+   * Fill in any empty row from the sheet itself: the Dashboard column whose header is the nation's
+   * name (alone, or followed by its "(Z)"-style region tag), and the tab of that same name, else the
+   * plain nation name, whichever exists. Nothing is saved until you press Save.
+   */
+  const field = (row, name) => row.querySelector(`[name="${name}"]`);
+  const blank = (row) => !field(row, "dashboardColumn").value.trim() && !field(row, "sheetName").value.trim();
+
+  /** Row 1 of the Dashboard, trimmed; or null when it cannot be read. */
+  async function dashboardColumns() {
+    const [header] = await runOps([{ action: "read", tab: DASHBOARD_TAB, range: "A1:AZ1" }]);
+    return header.ok ? (header.values[0] || []).map((cell) => String(cell ?? "").trim()).filter(Boolean) : null;
+  }
+
+  function setNote(row, text, color) {
+    const note = row.querySelector(".clop-guess");
+    note.textContent = text;
+    note.style.color = color || "";
+  }
+
+  /**
+   * On Save: check every filled-in row against the sheet, and say in red next to it when its column
+   * is not in row 1 of the Dashboard or its tab does not exist. Saving goes ahead either way.
+   */
+  async function checkNames(table) {
+    const rows = [...table.querySelectorAll("tr[data-nation]")].filter((row) => !blank(row));
+    if (!rows.length) return;
+    for (const row of rows) setNote(row, "checking the sheet...");
+    const columns = await dashboardColumns();
+    for (const row of rows) {
+      const column = field(row, "dashboardColumn").value.trim();
+      const tab = field(row, "sheetName").value.trim();
+      const warnings = [];
+      if (!column) warnings.push("Dashboard Column Name is empty");
+      else if (!columns) warnings.push(`could not read row 1 of ${DASHBOARD_TAB}`);
+      else if (!columns.includes(column)) warnings.push(`no column named "${column}" in row 1 of ${DASHBOARD_TAB}`);
+      if (!tab) warnings.push("Sheet Name is empty");
+      else {
+        const [probe] = await runOps([{ action: "read", tab, range: "A1" }]);
+        if (!probe.ok) warnings.push(`no tab named "${tab}"`);
+      }
+      if (warnings.length) setNote(row, `⚠ ${warnings.join("; ")}`, "#ff8b80");
+      else setNote(row, "✓ found in the sheet", "#7fd17f");
+    }
+  }
+
+  async function guessNames(table) {
+    const rows = [...table.querySelectorAll("tr[data-nation]")].filter(blank);
+    if (!rows.length) return;
+    const columns = await dashboardColumns();
+    if (!columns) return;
+    for (const row of rows) {
+      const nation = row.dataset.nation;
+      const column = columns.find((name) => name === nation) ||
+        columns.find((name) => name.startsWith(`${nation}(`) || name.startsWith(`${nation} (`));
+      const candidates = [...new Set([column, nation].filter(Boolean))];
+      const probes = await runOps(candidates.map((tab) => ({ action: "read", tab, range: "A1" })));
+      const tab = candidates.find((_, i) => probes[i].ok);
+      if (!blank(row) || (!column && !tab)) continue; // you started typing, or there is nothing to suggest
+      if (column) field(row, "dashboardColumn").value = column;
+      if (tab) field(row, "sheetName").value = tab;
+      row.querySelector(".clop-guess").textContent = "← found in the sheet; check it, then Save";
+    }
   }
 
   // ------------------------------------------------------------------------------------------

@@ -10,7 +10,10 @@ and back, so it can read that nation (see [Your other nations](#your-other-natio
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
+1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
+   in your browser (on Firefox, both are on addons.mozilla.org). **Greasemonkey 4 won't work.** It
+   only has an async API and no way for tabs to see each other's changes, which the script relies
+   on. Under Greasemonkey the script just shows a note saying so.
 2. Open `clop-sheet-sync.user.js` from this repo's **Raw** view. Tampermonkey offers to install it.
    (You can also go to Tampermonkey → *Create a new script*, paste the file in, and save.)
 3. The first time it connects to 4clop.org and to the sheet, Tampermonkey asks for permission.
@@ -29,10 +32,17 @@ nation dropdown, so you fill them all in at once without switching:
 | Field | What to type | Example |
 |---|---|---|
 | **Dashboard Column Name** | That nation's header in row 1 of the `Dashboard-Stockpile` tab, exactly as written | `Vladihoofstock(Z)` |
-| **Sheet Name** | The name of that nation's own tab | `VladihoofstockZ` |
+| **Sheet Name** | The name of that nation's own tab, exactly as written (brackets included) | `Vladihoofstock(Z)` |
 
-Click **Save Sheet Settings** and it syncs every nation right away. The lines under the buttons say
-how each one went. Leave a row empty to skip that nation.
+You usually don't have to type anything. For every empty row, the form looks in row 1 of the
+Dashboard for a column named after the nation (on its own or followed by its region tag, like
+`(Z)`). It also checks which tab exists, and fills both in with a note saying it found them. Check
+them, then click **Save Sheet Settings**. Nothing is saved until you do.
+
+Saving also checks every row against the sheet. If the column isn't in row 1 of the Dashboard or
+the tab doesn't exist, you get a red **⚠** next to that row; otherwise **✓ found in the sheet**.
+Saving syncs every nation right away. The lines under the buttons say how each one went. Leave a row
+empty to skip that nation.
 
 ## What it writes
 
@@ -84,7 +94,11 @@ and they go last, so a failed write can never leave a fresh stamp sitting over s
 - **Every minute** while any 4clop.org tab is open, even if you're not clicking.
 - **Every 2 minutes** when no 4clop.org tab is open but the browser has any other tab open. It
   uses your 4clop.org login cookie, so you only need to be logged in. A userscript can't run with
-  no tabs open at all; that would take a full browser extension.
+  no tabs open at all; that would take a full browser extension. Some setups (Firefox in
+  particular) don't send that cookie with the userscript manager's own requests. If the badge says
+  4clop.org "answered as if you were logged out when asked from a tab on another site", that's what
+  happened: syncing still works whenever a 4clop.org tab is open, because on the game's own pages
+  the script reads the game exactly the way the page does.
 - On pages where you usually change things (Overview, Deals, Marketplace, My Offers, Transfers,
   Actions, …), on every page load, apart from a 10-second debounce.
 - The nation you're on syncs every round. Your other nations are visited only when you press
@@ -106,7 +120,8 @@ forces, the API). Each other nation adds 3 more, plus one to switch back.
 On 4clop.org pages there's a badge in the bottom-right corner. Collapsed, it's a small pill whose
 colour shows how the last sync went. Click it to open the panel: one line per nation, any problems
 listed underneath, and a big **⟳ Sync now** button. **–** collapses it again, and it stays the way
-you left it.
+you left it. The exception is a failure or a problem you haven't seen yet: that opens the panel by
+itself, so you can't miss it. Collapsing it marks it seen.
 
 Green means a clean sync and amber means it synced, but some part of the sheet had a problem.
 Red means the sync failed or you're logged out, and grey means it isn't set up yet.
