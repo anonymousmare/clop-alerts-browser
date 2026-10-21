@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      2.0.1
+// @version      2.1.0
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        *://*/*
 // @noframes
@@ -1504,7 +1504,8 @@
       row.dataset.nation = name;
       row.innerHTML = `<td style="padding-right:8px"></td>
         <td><input name="dashboardColumn" class="form-control" style="width:200px;" placeholder="e.g. LePone(Z)" autocomplete="off"/></td>
-        <td><input name="sheetName" class="form-control" style="width:200px;" placeholder="its own tab" autocomplete="off"/></td>`;
+        <td><input name="sheetName" class="form-control" style="width:200px;" placeholder="e.g. LePone(Z)" autocomplete="off"/></td>
+        <td class="clop-guess" style="padding-left:8px;font-size:12px;opacity:.8"></td>`;
       row.cells[0].textContent = name;
       const current = settings[name] || {};
       row.querySelector('[name="dashboardColumn"]').value = current.dashboardColumn || "";
@@ -1530,6 +1531,34 @@
       runRound({ force: true });
     });
     anchor.parentNode.insertBefore(form, anchor);
+    guessNames(table).catch((error) => console.warn("[CLOP Sheet Sync] could not guess sheet names:", error));
+  }
+
+  /**
+   * Fill in any empty row from the sheet itself: the Dashboard column whose header is the nation's
+   * name (alone, or followed by its "(Z)"-style region tag), and the tab of that same name, else the
+   * plain nation name, whichever exists. Nothing is saved until you press Save.
+   */
+  async function guessNames(table) {
+    const field = (row, name) => row.querySelector(`[name="${name}"]`);
+    const blank = (row) => !field(row, "dashboardColumn").value.trim() && !field(row, "sheetName").value.trim();
+    const rows = [...table.querySelectorAll("tr[data-nation]")].filter(blank);
+    if (!rows.length) return;
+    const [header] = await runOps([{ action: "read", tab: DASHBOARD_TAB, range: "A1:AZ1" }]);
+    if (!header.ok) return;
+    const columns = (header.values[0] || []).map((cell) => String(cell ?? "").trim()).filter(Boolean);
+    for (const row of rows) {
+      const nation = row.dataset.nation;
+      const column = columns.find((name) => name === nation) ||
+        columns.find((name) => name.startsWith(`${nation}(`) || name.startsWith(`${nation} (`));
+      const candidates = [...new Set([column, nation].filter(Boolean))];
+      const probes = await runOps(candidates.map((tab) => ({ action: "read", tab, range: "A1" })));
+      const tab = candidates.find((_, i) => probes[i].ok);
+      if (!blank(row) || (!column && !tab)) continue; // you started typing, or there is nothing to suggest
+      if (column) field(row, "dashboardColumn").value = column;
+      if (tab) field(row, "sheetName").value = tab;
+      row.querySelector(".clop-guess").textContent = "← found in the sheet; check it, then Save";
+    }
   }
 
   // ------------------------------------------------------------------------------------------

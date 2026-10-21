@@ -113,8 +113,8 @@ class FakeSheet {
 function freshSheet(options) {
   return new FakeSheet({
     "Dashboard-Stockpile": parseTsv(fixture("dashboard-stockpile.tsv")),
-    VladihoofstockZ: parseTsv(fixture("nation-tab.tsv")),
-    LanathesisZ: parseTsv(fixture("nation-tab.tsv")),
+    "Vladihoofstock(Z)": parseTsv(fixture("nation-tab.tsv")),
+    "Lanathesis(Z)": parseTsv(fixture("nation-tab.tsv")),
   }, options);
 }
 
@@ -241,7 +241,7 @@ async function configure(tab, rows) {
   await tab.click('#clop-sheet-sync-form input[type="submit"]');
   return waitForResult(tab, Object.keys(rows).length);
 }
-const VLAD_ROWS = { Vladihoofstock: ["Vladihoofstock(Z)", "VladihoofstockZ"] };
+const VLAD_ROWS = { Vladihoofstock: ["Vladihoofstock(Z)", "Vladihoofstock(Z)"] };
 
 /** Wait until the round is over and `count` nations report a result (or the round failed). */
 async function waitForResult(tab, count = 1) {
@@ -275,14 +275,14 @@ const test = (name, fn) => tests.push({ name, fn });
 test("full sync writes buildings, stock, troops, dashboard, deals and market -- and nothing else", async (browser) => {
   const sheet = freshSheet();
   // Make a few cells wrong so there is something to correct.
-  sheet.set("VladihoofstockZ", "B9", 0);       // Basic Mine have (game: 138)
-  sheet.set("VladihoofstockZ", "B58", 5);      // Basic Mine disabled (game: 2)
-  sheet.set("VladihoofstockZ", "R12", 1);      // oil HAVE (game: 29816)
-  sheet.set("VladihoofstockZ", "R41", 0);      // Pegasi Have (game: 1)
-  sheet.set("VladihoofstockZ", "R39", 4);      // Cavalry Have (game: 0)
+  sheet.set("Vladihoofstock(Z)", "B9", 0);       // Basic Mine have (game: 138)
+  sheet.set("Vladihoofstock(Z)", "B58", 5);      // Basic Mine disabled (game: 2)
+  sheet.set("Vladihoofstock(Z)", "R12", 1);      // oil HAVE (game: 29816)
+  sheet.set("Vladihoofstock(Z)", "R41", 0);      // Pegasi Have (game: 1)
+  sheet.set("Vladihoofstock(Z)", "R39", 4);      // Cavalry Have (game: 0)
   sheet.set("Dashboard-Stockpile", "J21", "#REF!"); // Oil (game: 29816)
   sheet.set("Dashboard-Stockpile", "J9", 99);  // Oil - tick (game: 16)
-  const before = { dash: clone(sheet.tabs["Dashboard-Stockpile"]), nation: clone(sheet.tabs.VladihoofstockZ) };
+  const before = { dash: clone(sheet.tabs["Dashboard-Stockpile"]), nation: clone(sheet.tabs["Vladihoofstock(Z)"]) };
 
   const game = new FakeGame();
   const tab = await open(browser, sheet, game);
@@ -290,7 +290,7 @@ test("full sync writes buildings, stock, troops, dashboard, deals and market -- 
   assert.match(status, /Vladihoofstock synced at .* \(\d+ cell/, status);
 
   const get = (t, a1) => sheet.get(t, a1);
-  const D = "Dashboard-Stockpile", N = "VladihoofstockZ";
+  const D = "Dashboard-Stockpile", N = "Vladihoofstock(Z)";
   // Buildings
   assert.equal(get(N, "B9"), 138);
   assert.equal(get(N, "B58"), 2);
@@ -345,7 +345,7 @@ test("full sync writes buildings, stock, troops, dashboard, deals and market -- 
   await tab.click("#clop-sheet-sync-badge button:has-text('Sync now')");
   await tab.waitForFunction(() => /Sync now/.test(document.getElementById("clop-sheet-sync-badge").textContent));
   const extra = sheet.log.slice(writes).map((op) => `${op.tab}!${op.range}`);
-  assert.deepEqual(extra.sort(), ["Dashboard-Stockpile!J3:J3", "VladihoofstockZ!W10:W10"], `forced resync wrote ${extra}`);
+  assert.deepEqual(extra.sort(), ["Dashboard-Stockpile!J3:J3", "Vladihoofstock(Z)!W10:W10"], `forced resync wrote ${extra}`);
   // ...and collapses again, remembering it.
   await tab.click("#clop-sheet-sync-badge button[title='Collapse']");
   await tab.reload();
@@ -357,7 +357,7 @@ test("full sync writes buildings, stock, troops, dashboard, deals and market -- 
 test("game requests are spaced at least a second apart", async (browser) => {
   const game = new FakeGame({ nations: [VLAD, LANA] });
   const tab = await open(browser, freshSheet(), game);
-  await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
+  await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "Lanathesis(Z)"] });
   const times = game.log.map((entry) => entry.at);
   const gaps = times.slice(1).map((t, i) => t - times[i]);
   // Your userinfo.php load, then 8 from the script: overview, deals, forces; switch, deals, forces;
@@ -375,17 +375,37 @@ test("every nation in the empire gets its own row and is synced by switching and
   const rows = await tab.$$eval("#clop-sheet-sync-form tr[data-nation]", (trs) => trs.map((tr) => tr.cells[0].textContent));
   assert.deepEqual(rows, ["Vladihoofstock", "Lanathesis"]);
 
-  const status = await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
+  const status = await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "Lanathesis(Z)"] });
   assert.match(status, /Vladihoofstock synced at/, status);
   assert.match(status, /Lanathesis synced at/, status);
   // You pressed it while looking, so you were told, and told when it finished.
   await tab.waitForFunction(() => /Done! Synced/.test(document.getElementById("clop-sheet-sync-wait")?.textContent || ""));
   assert.equal(sheet.get("Dashboard-Stockpile", "J19"), 20868);   // Vladihoofstock's apples
   assert.equal(sheet.get("Dashboard-Stockpile", "M19"), 11111);   // Lanathesis's apples
-  assert.equal(sheet.get("LanathesisZ", "R11"), 11111);
+  assert.equal(sheet.get("Lanathesis(Z)", "R11"), 11111);
   assert.equal(game.active, VLAD.id, "the session was not switched back");
   const switches = game.log.filter((entry) => entry.form.switchnation_id).map((entry) => Number(entry.form.switchnation_id));
   assert.deepEqual(switches, [LANA.id, VLAD.id]);
+  await tab.context().close();
+});
+
+test("User Info fills in each nation's column and tab from the sheet when they are blank", async (browser) => {
+  const game = new FakeGame({ nations: [VLAD, LANA, { id: 77, name: "Nowhere Land" }] });
+  const tab = await open(browser, freshSheet(), game);
+  await tab.goto("https://4clop.org/userinfo.php");
+  const value = (nation, field) => tab.inputValue(`#clop-sheet-sync-form tr[data-nation="${nation}"] input[name="${field}"]`);
+  await tab.waitForFunction(() => document.querySelectorAll(".clop-guess:not(:empty)").length === 2, null, { timeout: 30000 });
+  assert.equal(await value("Vladihoofstock", "dashboardColumn"), "Vladihoofstock(Z)");
+  assert.equal(await value("Vladihoofstock", "sheetName"), "Vladihoofstock(Z)");
+  assert.equal(await value("Lanathesis", "dashboardColumn"), "Lanathesis(Z)");
+  assert.equal(await value("Lanathesis", "sheetName"), "Lanathesis(Z)");
+  assert.equal(await value("Nowhere Land", "dashboardColumn"), "");   // nothing in the sheet for it
+  // Guesses are not saved until you press Save.
+  assert.deepEqual(await tab.evaluate(() => GM_getValue("settings", {})), {});
+  await tab.click('#clop-sheet-sync-form input[type="submit"]');
+  const status = await waitForResult(tab, 2);
+  assert.match(status, /Vladihoofstock synced at/, status);
+  assert.match(status, /Lanathesis synced at/, status);
   await tab.context().close();
 });
 
@@ -419,7 +439,7 @@ test("tabbing in mid-visit says Working! (and lets nothing through), then Done! 
 test("while a 4clop tab is on screen, timed rounds leave the other nations alone", async (browser) => {
   const game = new FakeGame({ nations: [VLAD, LANA] });
   const tab = await open(browser, freshSheet(), game);
-  await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
+  await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "Lanathesis(Z)"] });
   const switches = () => game.log.filter((entry) => entry.form.switchnation_id).length;
   assert.equal(switches(), 2); // the Save above counts as a manual sync
   await tab.goto("https://4clop.org/news.php");
@@ -443,12 +463,12 @@ test("with no 4clop tab on screen, timed rounds visit the other nations too", as
   const tab = await open(browser, sheet, game);
   await tab.goto("https://example.com/");
   await tab.evaluate(() => GM_setValue("settings", {
-    Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "VladihoofstockZ" },
-    Lanathesis: { dashboardColumn: "Lanathesis(Z)", sheetName: "LanathesisZ" },
+    Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "Vladihoofstock(Z)" },
+    Lanathesis: { dashboardColumn: "Lanathesis(Z)", sheetName: "Lanathesis(Z)" },
   }));
   await tab.reload();
   await tab.waitForFunction(() => (GM_getValue("state", {}).Lanathesis || {}).checkedAt, null, { timeout: 30000 });
-  assert.equal(sheet.get("LanathesisZ", "R11"), 11111);
+  assert.equal(sheet.get("Lanathesis(Z)", "R11"), 11111);
   assert.equal(game.active, VLAD.id);
   await tab.context().close();
 });
@@ -468,13 +488,13 @@ test("a visit abandoned mid-way (tab closed) is switched back by the next tab", 
 
 test("it syncs from a tab on another site, and shows nothing there", async (browser) => {
   const sheet = freshSheet();
-  sheet.set("VladihoofstockZ", "B9", 0);
+  sheet.set("Vladihoofstock(Z)", "B9", 0);
   const tab = await open(browser, sheet);
   await tab.goto("https://example.com/");
-  await tab.evaluate(() => GM_setValue("settings", { Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "VladihoofstockZ" } }));
+  await tab.evaluate(() => GM_setValue("settings", { Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "Vladihoofstock(Z)" } }));
   await tab.reload();
   await tab.waitForFunction(() => (GM_getValue("state", {}).Vladihoofstock || {}).checkedAt, null, { timeout: 30000 });
-  assert.equal(sheet.get("VladihoofstockZ", "B9"), 138);
+  assert.equal(sheet.get("Vladihoofstock(Z)", "B9"), 138);
   assert.equal(await tab.$("#clop-sheet-sync-badge"), null);
   await tab.context().close();
 });
@@ -493,14 +513,14 @@ test("an older endpoint without batch still gets the same writes, one call each"
 
 test("a wrong Dashboard Column Name skips the dashboard but still updates the nation tab", async (browser) => {
   const sheet = freshSheet();
-  sheet.set("VladihoofstockZ", "B9", 0);
+  sheet.set("Vladihoofstock(Z)", "B9", 0);
   const dash = clone(sheet.tabs["Dashboard-Stockpile"]);
   const tab = await open(browser, sheet);
-  const status = await configure(tab, { Vladihoofstock: ["Vladihoofstock", "VladihoofstockZ"] });
+  const status = await configure(tab, { Vladihoofstock: ["Vladihoofstock", "Vladihoofstock(Z)"] });
   assert.match(status, /1 problem/, status);
   assert.match(status, /no column in row 1 of Dashboard-Stockpile is named "Vladihoofstock"/);
   assert.deepEqual(sheet.tabs["Dashboard-Stockpile"], dash);
-  assert.equal(sheet.get("VladihoofstockZ", "B9"), 138);
+  assert.equal(sheet.get("Vladihoofstock(Z)", "B9"), 138);
   await tab.context().close();
 });
 
@@ -557,11 +577,11 @@ test("a duplicated label refuses only the block it is in", async (browser) => {
 
 test("troop counts that do not add up to overview's military upkeep leave the TROOPS block alone", async (browser) => {
   const sheet = freshSheet();
-  sheet.set("VladihoofstockZ", "R40", 9);
+  sheet.set("Vladihoofstock(Z)", "R40", 9);
   const tab = await open(browser, sheet, new FakeGame({ extraForces: true }));
   const status = await configure(tab, VLAD_ROWS);
   assert.match(status, /would use 10 gems, 15 gasoline but overview\.php says your military uses 0 gems, 0 gasoline/, status);
-  assert.equal(sheet.get("VladihoofstockZ", "R40"), 9);          // untouched
+  assert.equal(sheet.get("Vladihoofstock(Z)", "R40"), 9);          // untouched
   assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);   // everything else still synced
   await tab.context().close();
 });

@@ -32,10 +32,15 @@ nation dropdown, so you fill them all in at once without switching:
 | Field | What to type | Example |
 |---|---|---|
 | **Dashboard Column Name** | That nation's header in row 1 of the `Dashboard-Stockpile` tab, exactly as written | `Vladihoofstock(Z)` |
-| **Sheet Name** | The name of that nation's own tab | `VladihoofstockZ` |
+| **Sheet Name** | The name of that nation's own tab, exactly as written (brackets included) | `Vladihoofstock(Z)` |
 
-Click **Save Sheet Settings** and it syncs every nation right away. The lines under the buttons say
-how each one went. Leave a row empty to skip that nation.
+You usually don't have to type anything. For every empty row, the form looks in row 1 of the
+Dashboard for a column named after the nation (on its own or followed by its region tag, like
+`(Z)`). It also checks which tab exists, and fills both in with a note saying it found them. Check
+them, then click **Save Sheet Settings**. Nothing is saved until you do.
+
+Saving syncs every nation right away. The lines under the buttons say how each one went. Leave a row
+empty to skip that nation.
 
 ## What it writes
 
