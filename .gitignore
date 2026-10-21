@@ -1,5 +1,1 @@
-.env
-settings.json
-.state/
-__pycache__/
-*.log
+node_modules/

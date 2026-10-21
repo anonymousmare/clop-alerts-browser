@@ -1,0 +1,52 @@
+<center>Make a deal with the nation of
+<form action="deals.php" method="post">
+<input type="hidden" name="token_deals" value="abc"/>
+<input type="text" class="form-control" name="nationname" style="width:200px;"/>
+<input type="submit" name="makedeal" value="Make Deal" class="btn btn-success btn-primary"/>
+</form>
+    <center><h4><a href="viewnation.php?nation_id=3"/>Lanathesis</a></h4></center>
+    <center>You offer 5,000 bits for this deal</center>
+    <center><h4>Offered Items</h4></center>
+    <center><table class="table table-striped table-bordered" style="width:400px;">
+<tr><td>Oil</td><td>1,000</td></tr>
+<tr><td>Apples</td><td>250</td></tr>
+</table></center>
+    <center><h4>Offered Weapons</h4></center>
+    <center><table class="table table-striped table-bordered" style="width:400px;">
+<tr><td>Shoreline</td><td>7</td></tr>
+</table></center>
+    <center><h4>Requested Items</h4></center>
+    <center><table class="table table-striped table-bordered" style="width:400px;">
+<tr><td>Gems</td><td>10</td></tr>
+</table></center>
+	<form action="deals.php" method="post">
+    <input type="hidden" name="token_deals" value="abc"/>
+	<input type="hidden" name="deal_id" value="41"/>
+	<center>This deal is finalized and sent; you cannot edit it.</center>
+	<input type="submit" name="canceldeal" value="Cancel Deal" class="btn btn-danger btn-primary"/>
+	</form>
+    <center><h4><a href="viewnation.php?nation_id=4"/>Starlight Reach</a></h4></center>
+    <center>You request 2,000 bits for this deal</center>
+    <center><h4>Offered Items</h4></center>
+    <center><table class="table table-striped table-bordered" style="width:400px;">
+<tr><td>Oil</td><td>24</td></tr>
+<tr><td>DNA - North Saddle Arabia</td><td>15</td></tr>
+</table></center>
+	<form action="deals.php" method="post">
+    <input type="hidden" name="token_deals" value="abc"/>
+	<input type="hidden" name="deal_id" value="42"/>
+	<center><a href="makedeal.php?deal_id=42">Edit Deal</a></center>
+	<input type="submit" name="canceldeal" value="Cancel Deal" class="btn btn-danger btn-primary"/>
+	</form>
+    <center><h4><a href="viewnation.php?nation_id=5"/>Sunlit Fields</a></h4></center>
+    <center>offers 9,999 bits for this deal</center>
+    <center><h4>Offered Items</h4></center>
+    <center><table class="table table-striped table-bordered" style="width:400px;">
+<tr><td>Gems</td><td>99</td></tr>
+</table></center>
+	<form action="deals.php" method="post">
+    <input type="hidden" name="token_deals" value="abc"/>
+	<input type="hidden" name="deal_id" value="43"/>
+	<center><input type="submit" name="acceptdeal" value="Accept Deal" class="btn btn-success btn-primary"/>
+	<input type="submit" name="rejectdeal" value="Reject Deal" class="btn btn-danger btn-primary"/></center>
+	</form>

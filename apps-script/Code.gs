@@ -6,7 +6,7 @@
  * deployment is what lets the repo carry no Google credentials at all: the identity lives inside
  * the deployment, and the repo holds only its public /exec URL.
  *
- * Redeploying is documented step by step in README.md next to this file. Keep the two in sync.
+ * Redeploying is documented in the repo README ("The sheet endpoint"). Keep the two in sync.
  *
  * ---------------------------------------------------------------------------------------------
  * Wire protocol (POST, application/json)
