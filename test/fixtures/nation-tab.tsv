@@ -1,0 +1,97 @@
+	Sat	SE Rep	NLR Rep	Apples	Cider	Pies	Oil	Energy	Gas	Copper	Coffee	Gems	Tungsten	Drugs	Toys	Plastic	M Part	V Part	DNA	GDP(k)		GOVERNMENT	Independence		
+Current >	4	-2	28	-920	0	97	-1664	26	5	1728	-363	154	180	0	97	16	-110	-279	1	48405		ECONOMY	State Controlled		
+New >	4	-2	28	-920	0	97	-1664	26	5	1728	-363	154	180	0	97	16	-110	-279	1	48405		TICK STOCKS	20		
+																						IS PRZE?	No		
+Alliance New>				200	-57	81	-2436	2345	2741	12124	606	1428	1556	60	123	1206	-390	-1005				Max Sat	Yes		
+Total Used>				911	385	278	1664	1378	1027		363	110			275	124	-110	-279				Nations	1		
+																									
+Building	Have	Want	sat cur	sat new	COST>	Bits	Copper	M Part	V Part	P Part	Comp	Tung	Plastic	Energy	Diff										
+Basic Mine	138	138	-847	-847		0									0										
+Mecha Mine	131	131	-990	-990		0	0	0	0						0	STOCK	HAVE	NEED	BUY	TICKS (AFTER BUILD)		2026-10-21 00:10:39	BOOTSTRAPPING (@ Tick Stock for consumables)		
+Gem Mine	88	88	-546	-546		0	0	0							0	apple	20868	18400	-2468	22			apple	0	
+Tungsten Mine	45	45	-146	-146		0		0	0	0					0	oil	29816	33280	3464	17			oil	-1206	
+																coffee	19753	7260	-12493	54			cider	0	
+Basic Orchard	0	0	0	0		0									0	mpart	5900	2200	-3700	53			pie	0	
+Mecha Orchard	0	0	0	0		0		0	0						0	vpart	10170	5580	-4590	36			coffee	-220	
+Coffee Farm	0	0	0	0		0		0	0						0	gems	3092	3080	0	inf			toys	0	
+Drug Farm	0	0				0									0								plastic	0	
+																							gas	0	
+Basic Oil	0	0	0	0		0									0	COST	Bits	0	0	< (million bits)			gems	0	
+Mech Oil	0	0	0	0		0	0	0	0						0	Copper	0		Comp	0					
+Fracker	0	0	0	0		0	0	0	0		0				0	M Part	0		Tung	0			copper total >	0	
+																V Part	0		Plastic	0			parts manufacturing >	0	
+Cider Facility	77	77				0	0	0	0						0	P Part	0		Energy	0					
+Energy Collector	0	0													0				E/tick	-1378					
+Oil Combustion	23	23	-69	-69		0	0	0							0										
+Gas Combustion	94	94				0	0	0							0	Net Change in				Zeb:		SAT COST	RESOURCE PER SAT:		(higher better)
+Gas Refinery	134	134				0	0	0	0					0	0	Raw Resources:				Copper (Basic)		12	0.4166666667		
+Plastics Factory	35	35	-90	-90		0		0	0	0					0					Copper (Mech)		17	0.4705882353		
+Prze Adv Plastic	0	0	0	0		0		0		0	0				0	Apple	0			Gems		12	0.6666666667		
+Toy Factory	124	124				0	0	0		0					0	Coffee	0			Tungsten		6	1.333333333		
+																Oil	0								
+Bakery	125	125	125	125		0	0	0	0					0	0	Copper	0								
+Bar	3	3	30	30		0	0								0	Gems	0								
+Coffee Shop	0	0	0	0		0	0								0	Tung	0								
+Statue	0	0	0	0		0	0								0										
+Toy & Candy	120	120	3600	3600		0	0								0	TOTAL:	0								
+Video Arcade	0	0	0	0		0	0							0	0										
+Mall	55	55	2750	2750		0	0	0	0			0			0	TROOPS	Have	Want							
+																Cavalry	0	0							
+Basic Factory	1	1	-1	-1		0	0							0	0	Tanks	0	0							
+Adv Factory	1	1	-1	-1		0	0	0	0					0	0	Pegasi	1	1							
+DNA	1	1	0	0		0									0	Unicorns	0	0							
+Barracks	20	20	-126	-126		0	0	0	0					0	0	Navy	0	0							
+																Alicorns	0	0							
+Moon Worship	28	28				0	0						0		0	12h/Upkeep	Current	New							
+Sun Worship	0	0				0	0						0		0	Apple	0	0							
+																Gas	0	0							
+Lunar Enviro	5	5				0	0	0			0				0	Coffee	5	5							
+Solar Enviro	5	5				0	0	0			0				0	Gems	0	0							
+Forbidden Research	1	1				0	0	0		0					0	Total:	1	1							
+Alicornification	0	0													0	Sat Use:	0	0							
+			0	0																					
+MAX SAT:			-30	-30																					
+EMPIRE:			0	0																					
+DISABLED:																									
+																									
+Building			sat cur	sat new		Built	Planned			Zeb:		SAT COST		RESOURCE PER SAT:		(higher better)									
+Basic Mine	2	2	19	19		138	138			Copper (Basic)		10		0.5											
+Mecha Mine	0	0	0	0		131	131			Copper (Mech)		17		0.4705882353											
+Gem Mine	0	0	0	0		88	88			Gems		12		0.6666666667											
+Tungsten Mine	0	0	0	0		45	45			Tungsten		6		1.333333333											
+																									
+Basic Orchard	0	0	0	0		0	0																		
+Mecha Orchard	0	0	0	0		0	0																		
+Coffee Farm	0	0	0	0		0	0																		
+Drug Farm	0	0	0	0		0	0																		
+																									
+Basic Oil	0		0	0		0	0																		
+Mech Oil	0		0	0		0	0																		
+Fracker	0		0	0		0	0																		
+																									
+Cider Facility	0	0	0	0		77	77																		
+Energy Collector	0		0	0		0	0																		
+Oil Combustion	0	0	0	0		23	23																		
+Gas Combustion	0	0	0	0		94	94																		
+Gas Refinery	0	0	0	0		134	134																		
+Plastics Factory	0	0	0	0		35	35																		
+Prze Adv Plastic	0		0	0		0	0																		
+Toy Factory	0	0	0	0		124	124																		
+																									
+Bakery	0	0	0	0		125	125																		
+Bar	0	0	0	0		3	3																		
+Coffee Shop	0	0	0	0		0	0																		
+Statue	0		0	0		0	0																		
+Toy & Candy	120	120	-3720	-3720		120	120																		
+Video Arcade	0		0	0		0	0																		
+Mall	0		0	0		55	55																		
+																									
+Basic Factory	0	0	0	0		1	1																		
+Adv Factory	0	0	0	0		1	1																		
+DNA	0	0	0	0		1	1																		
+Barracks	0	0				20	20																		
+																									
+Moon Worship	3	3	-3	-3		28	28																		
+Sun Worship	0	0	0	0		0	0																		
+																									
+Forbidden Research	1	1	-1	-1		1	1																		

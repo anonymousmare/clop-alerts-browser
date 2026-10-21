@@ -1,0 +1,42 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+    <link rel="icon" type="image/png" href="images/favicon.png" />
+    <title>{{TITLE}} - &gt;CLOP, the game of geoponitics</title>
+</head>
+<body alink="#00ae0e" link="#00ae0e" vlink="#1f8001">
+<meta content="text/html; charset=ISO-8859-1" http-equiv="content-type">
+<div id="content-outer"><center><img src="images/8.png" height="250"/></center><center><span id="topmessage"><a href="topmessage.php">API with the FULL global info is up, LETS GOOOOOOO! (Thanks, NuHost!)</a></span></center>
+<nav class="navbar navbar-default" role="navigation">
+<div class="navbar-header">
+</div>
+<ul class="nav navbar-nav">
+  <li><a class="dropdown-toggle" href="messages.php">Messages <span class="badge"></span></a></li>
+  <li class="dropdown">
+    <a href="#" class="dropdown-toggle" data-toggle="dropdown">User <b class="caret"></b></a>
+    <ul class="dropdown-menu">
+      <li><a href="userinfo.php">User Info</a></li>
+      <li><a href="transfer.php">Empire Transfers</a></li>
+      <li><a href="logout.php">Logout</a></li>
+    </ul>
+  </li>
+  <li class="dropdown">
+    <a href="#" class="dropdown-toggle" data-toggle="dropdown">Nation <b class="caret"></b></a>
+    <ul class="dropdown-menu">
+    <li><a href="overview.php">Overview</a></li>
+    </ul>
+  </li>
+</ul>
+<ul class="nav navbar-nav navbar-right pull-right">
+  {{NATIONLINE}}
+  <li><a>Server time: {{SERVERTIME}}</a></li>
+  <li><a>Next tick: <span class="text-danger" id="countdown">1:16:26</span></a></li>
+  <li><a href="statistics.php">Stats</a></li>
+<li><a href="news.php">News <span class="badge"></span></a></li>
+<div class="navbar-header"></div>
+</nav>
+<div id="content">  
+{{CONTENT}}</div>
+</div>
+</body>
+</html>

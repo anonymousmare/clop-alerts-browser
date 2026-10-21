@@ -1,0 +1,364 @@
+{
+ "nations": [
+  {
+   "nation_id": 3,
+   "user_id": 26,
+   "username": "Lacera Viscera",
+   "name": "Lanathesis",
+   "government": "Solar Vassal",
+   "economy": "Poorly Defined",
+   "region": 2,
+   "region_name": "Zebrica",
+   "subregion": 2,
+   "subregion_name": "Central",
+   "age": 64,
+   "gdp_last_turn": 652500,
+   "alliance_id": 12,
+   "structures": [
+    {
+     "resource_id": 31,
+     "name": "Advanced Factory",
+     "amount": 1
+    },
+    {
+     "resource_id": 12,
+     "name": "Bakery",
+     "amount": 128
+    },
+    {
+     "resource_id": 22,
+     "name": "Bar",
+     "amount": 12
+    },
+    {
+     "resource_id": 7,
+     "name": "Basic Copper Mine",
+     "amount": 137
+    },
+    {
+     "resource_id": 5,
+     "name": "Basic Factory",
+     "amount": 22
+    },
+    {
+     "resource_id": 17,
+     "name": "Cider Production Facility",
+     "amount": 30
+    },
+    {
+     "resource_id": 24,
+     "name": "Gasoline Combustion Facility",
+     "amount": 53
+    },
+    {
+     "resource_id": 23,
+     "name": "Gasoline Refinery",
+     "amount": 53
+    },
+    {
+     "resource_id": 32,
+     "name": "Gem Mine",
+     "amount": 84
+    },
+    {
+     "resource_id": 45,
+     "name": "Lunar Environmental Facility",
+     "amount": 5
+    },
+    {
+     "resource_id": 49,
+     "name": "Mall",
+     "amount": 13
+    },
+    {
+     "resource_id": 15,
+     "name": "Mechanized Copper Mine",
+     "amount": 135
+    },
+    {
+     "resource_id": 11,
+     "name": "Oil Combustion Facility",
+     "amount": 12
+    },
+    {
+     "resource_id": 34,
+     "name": "Plastics Factory",
+     "amount": 50
+    },
+    {
+     "resource_id": 44,
+     "name": "Solar Environmental Facility",
+     "amount": 5
+    },
+    {
+     "resource_id": 48,
+     "name": "Toy and Candy Shop",
+     "amount": 93
+    },
+    {
+     "resource_id": 46,
+     "name": "Toy Factory",
+     "amount": 124
+    },
+    {
+     "resource_id": 33,
+     "name": "Tungsten Mine",
+     "amount": 74
+    }
+   ],
+   "force_groups": []
+  },
+  {
+   "nation_id": 16,
+   "user_id": 16,
+   "username": "curio777",
+   "name": "Vladihoofstock",
+   "government": "Independence",
+   "economy": "State Controlled",
+   "region": 2,
+   "region_name": "Zebrica",
+   "subregion": 2,
+   "subregion_name": "Central",
+   "age": 64,
+   "gdp_last_turn": 48405000,
+   "alliance_id": 12,
+   "structures": [
+    {
+     "resource_id": 31,
+     "name": "Advanced Factory",
+     "amount": 1
+    },
+    {
+     "resource_id": 12,
+     "name": "Bakery",
+     "amount": 125
+    },
+    {
+     "resource_id": 22,
+     "name": "Bar",
+     "amount": 3
+    },
+    {
+     "resource_id": 36,
+     "name": "Barracks",
+     "amount": 20
+    },
+    {
+     "resource_id": 7,
+     "name": "Basic Copper Mine",
+     "amount": 138
+    },
+    {
+     "resource_id": 5,
+     "name": "Basic Factory",
+     "amount": 1
+    },
+    {
+     "resource_id": 17,
+     "name": "Cider Production Facility",
+     "amount": 77
+    },
+    {
+     "resource_id": 54,
+     "name": "DNA Extraction Facility - C. Zebrica",
+     "amount": 1
+    },
+    {
+     "resource_id": 74,
+     "name": "Forbidden Research Facility",
+     "amount": 1
+    },
+    {
+     "resource_id": 24,
+     "name": "Gasoline Combustion Facility",
+     "amount": 94
+    },
+    {
+     "resource_id": 23,
+     "name": "Gasoline Refinery",
+     "amount": 134
+    },
+    {
+     "resource_id": 32,
+     "name": "Gem Mine",
+     "amount": 88
+    },
+    {
+     "resource_id": 45,
+     "name": "Lunar Environmental Facility",
+     "amount": 5
+    },
+    {
+     "resource_id": 49,
+     "name": "Mall",
+     "amount": 55
+    },
+    {
+     "resource_id": 15,
+     "name": "Mechanized Copper Mine",
+     "amount": 131
+    },
+    {
+     "resource_id": 40,
+     "name": "Moon Worship Center",
+     "amount": 28
+    },
+    {
+     "resource_id": 11,
+     "name": "Oil Combustion Facility",
+     "amount": 23
+    },
+    {
+     "resource_id": 34,
+     "name": "Plastics Factory",
+     "amount": 35
+    },
+    {
+     "resource_id": 44,
+     "name": "Solar Environmental Facility",
+     "amount": 5
+    },
+    {
+     "resource_id": 48,
+     "name": "Toy and Candy Shop",
+     "amount": 120
+    },
+    {
+     "resource_id": 46,
+     "name": "Toy Factory",
+     "amount": 124
+    },
+    {
+     "resource_id": 33,
+     "name": "Tungsten Mine",
+     "amount": 45
+    }
+   ],
+   "force_groups": []
+  }
+ ],
+ "alliances": [
+  {
+   "alliance_id": 3,
+   "name": "UnionEquineCorporation",
+   "nation_ids": []
+  },
+  {
+   "alliance_id": 6,
+   "name": "The Spice Trade",
+   "nation_ids": [
+    83
+   ]
+  }
+ ],
+ "market": {
+  "resources": {
+   "sell": [
+    {
+     "nation_id": 16,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 23848,
+     "price": 1000000
+    },
+    {
+     "nation_id": 16,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 73,
+     "price": 10000000
+    },
+    {
+     "nation_id": 95,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 52889,
+     "price": 12000
+    },
+    {
+     "nation_id": 87,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 1,
+     "price": 42069
+    },
+    {
+     "nation_id": 138,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 15000,
+     "price": 10000000
+    }
+   ],
+   "buy": [
+    {
+     "nation_id": 34,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 10000,
+     "price": 1000
+    },
+    {
+     "nation_id": 75,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 10000,
+     "price": 1000
+    },
+    {
+     "nation_id": 81,
+     "item_id": 1,
+     "item_name": "Oil",
+     "amount": 15000,
+     "price": 1000
+    },
+    {
+     "nation_id": 16,
+     "item_id": 20,
+     "item_name": "Coffee",
+     "amount": 100,
+     "price": 1000
+    }
+   ]
+  },
+  "weapons": {
+   "sell": [
+    {
+     "nation_id": 16,
+     "item_id": 17,
+     "item_name": "Shoreline",
+     "amount": 232,
+     "price": 10000000
+    }
+   ],
+   "buy": [
+    {
+     "nation_id": 6,
+     "item_id": 12,
+     "item_name": "Steam Bucket",
+     "amount": 1,
+     "price": 1000
+    },
+    {
+     "nation_id": 16,
+     "item_id": 12,
+     "item_name": "Steam Bucket",
+     "amount": 2,
+     "price": 5000
+    }
+   ]
+  },
+  "armor": {
+   "sell": [
+    {
+     "nation_id": 16,
+     "item_id": 17,
+     "item_name": "Esohes",
+     "amount": 206,
+     "price": 10000000
+    }
+   ],
+   "buy": []
+  }
+ }
+}

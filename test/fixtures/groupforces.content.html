@@ -1,0 +1,54 @@
+<div class="panel panel-default">
+    <div class="panel-heading">
+        <div class="row">
+            <div class="col-md-6">
+                <form action="groupforces.php" method="post">
+                    <input type="hidden" name="token_groupforces" value="abc"/>
+                    <input type="hidden" name="forcegroup_id" value="1429"/>
+                    <div class="input-group">
+                        <input name="name" class="form-control" placeholder="Name" value="Most High and Fine and Amazing and Pretty"/>
+                        <span class="input-group-btn">
+                            <input type="submit" name="renamegroup" value="Rename Group" class="btn btn-info"/>
+                        </span>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    <table class="table table-bordered">
+
+        <tr>
+            <td>
+                <form action="groupforces.php" method="post">
+                    <input type="hidden" name="token_groupforces" value="abc"/>
+                    <input type="hidden" name="force_id" value="1741"/>
+                    <div class="input-group">
+                        <input name="name" class="form-control" placeholder="Name" value="Princess Curio"/>
+                        <span class="input-group-btn">
+                            <input type="submit" name="renameforce" value="Rename Force" class="btn btn-info"/>
+                        </span>
+                    </div>
+                </form>
+                <br/>
+                Pegasi<br/>
+                Canopy Lights<br/>
+                Griffin<br/>
+                Size: 1<br/>
+                Training: 20</td><td>
+                <form action="groupforces.php" method="post">
+                    <input type="hidden" name="token_groupforces" value="abc"/>
+                    <input type="hidden" name="force_id" value="1741"/>
+                    <div class="input-group">
+                        <input type="submit" name="combineforces" value="Combine With" class="btn btn-info"/>
+                        <select name="targetforce_id" class="form-control" style="width:200px;"/>
+                        </select>
+                    </div>
+                </form><br/>
+                <form action="groupforces.php" method="post">
+                    <input type="hidden" name="token_groupforces" value="abc"/>
+                    <input type="hidden" name="force_id" value="1741"/>
+                    <input type="submit" onclick="return confirm('Really destroy Princess Curio? ')" name="destroy" value="Destroy" class="btn btn-danger"/>
+                </form>
+            </td>
+        </tr>
+</table></div>
