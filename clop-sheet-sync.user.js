@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      2.3.0
+// @version      2.3.1
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        *://*/*
 // @noframes
@@ -426,9 +426,28 @@
       const active = selected ? all.find((nation) => nation.id === parseInt(selected.getAttribute("value"), 10)) : null;
       return { active: active || null, all };
     }
-    const first = doc.querySelector("ul.navbar-right > li > a");
-    const name = first ? text(first) : "";
+    const item = singleNationItem(doc);
+    const name = item ? text(item) : "";
     return name ? { active: { id: null, name }, all: [{ id: null, name }] } : { active: null, all: [] };
+  }
+
+  /**
+   * The navbar's plain `<li><a>Name</a></li>` for a one-nation login. header.php prints it right
+   * before the "Server time:" item, and that is how it is found -- not as the first item, because
+   * other userscripts add their own there (4clopX puts its "⚙" settings link and a countdown at the
+   * front). Failing that, the first bare link: no href, no title, no class, nothing but text.
+   */
+  function singleNationItem(doc) {
+    const items = [...doc.querySelectorAll("ul.navbar-right > li")];
+    const clock = items.findIndex((li) => /^Server time:/.test(text(li)));
+    const bare = (li) => {
+      const a = li && li.children.length === 1 && li.firstElementChild;
+      return a && a.tagName === "A" && a.attributes.length === 0 && a.children.length === 0 && text(a) &&
+        !/^Server time:/.test(text(a)) ? a : null;
+    };
+    if (clock > 0 && bare(items[clock - 1])) return bare(items[clock - 1]);
+    for (const li of items) if (bare(li)) return bare(li);
+    return null;
   }
 
   function serverTime(doc) {
@@ -1237,8 +1256,30 @@
     return ACTION_PAGES.includes(page) ? SYNC_DEBOUNCE_MS : SYNC_MIN_INTERVAL_MS;
   }
 
+  /**
+   * Version 2.3.0 and earlier read the nation name from the first navbar item, which another
+   * userscript can own (4clopX's "⚙"), and so could save your settings under a "name" like "⚙".
+   * Move such settings to your nation -- only when the stray name has no letter or digit at all (so
+   * cannot be a real nation) and exactly one listed nation has no settings of its own.
+   * Returns true when it moved anything.
+   */
+  function adoptStraySettings(nations) {
+    const all = allSettings();
+    const listed = new Set(nations.map((nation) => nation.name));
+    const stray = Object.keys(all).filter((name) => !listed.has(name) && isConfigured(all[name]) && !/[\p{L}\p{N}]/u.test(name));
+    const unset = nations.filter((nation) => !isConfigured(all[nation.name]));
+    if (stray.length !== 1 || unset.length !== 1) return false;
+    all[unset[0].name] = all[stray[0]];
+    delete all[stray[0]];
+    GM_setValue("settings", all);
+    const states = GM_getValue("state", {});
+    delete states[stray[0]];
+    GM_setValue("state", states);
+    return true;
+  }
+
   async function runRound({ force = false } = {}) {
-    const settings = allSettings();
+    let settings = allSettings();
     if (!Object.values(settings).some(isConfigured)) return;
     if (!force && Date.now() - (roundState().lastAttempt || 0) < dueInterval()) return;
     if (runningSince && Date.now() - runningSince < ROUND_STUCK_MS) return;
@@ -1260,6 +1301,7 @@
       }
       const home = await readNation(homeHtml);
       rememberNations(home.overview.nations);
+      if (adoptStraySettings(home.overview.nations)) settings = allSettings();
       const homeRef = home.overview.nations.find((nation) => nation.name === home.name) || { id: null, name: home.name };
 
       // Other nations mean switching your session, so only on Sync now, or while you are not
