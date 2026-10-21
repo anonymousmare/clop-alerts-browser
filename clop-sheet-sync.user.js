@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      2.0.0
+// @version      2.0.1
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        *://*/*
 // @noframes
@@ -39,6 +39,31 @@
 
 (function () {
   "use strict";
+
+  // Greasemonkey 4 only has the async GM.* API and no value-change listener, which the cross-tab
+  // lock, the one-request-a-second limit and the "are you looking" check all rely on. Say so on
+  // 4clop.org instead of failing on the first storage call.
+  const MISSING = [
+    typeof GM_getValue !== "function" && "GM_getValue",
+    typeof GM_setValue !== "function" && "GM_setValue",
+    typeof GM_xmlhttpRequest !== "function" && "GM_xmlhttpRequest",
+    typeof GM_addValueChangeListener !== "function" && "GM_addValueChangeListener",
+  ].filter(Boolean);
+  if (MISSING.length) {
+    console.warn(`[CLOP Sheet Sync] this userscript manager does not provide ${MISSING.join(", ")}; use Tampermonkey or Violentmonkey.`);
+    if (/(^|\.)4clop\.org$/.test(location.hostname) && document.body) {
+      const note = document.createElement("div");
+      note.id = "clop-sheet-sync-unsupported";
+      note.style.cssText =
+        "position:fixed;right:12px;bottom:12px;z-index:9999;max-width:360px;padding:8px 12px;border-radius:6px;" +
+        "background:#b8322a;color:#fff;font:12px/1.4 sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.5)";
+      note.textContent =
+        "CLOP Sheet Sync can't run in this userscript manager (Greasemonkey 4 is missing " +
+        `${MISSING.join(", ")}). Install Tampermonkey or Violentmonkey and add the script there instead.`;
+      document.body.appendChild(note);
+    }
+    return;
+  }
 
   // ------------------------------------------------------------------------------------------
   // Configuration

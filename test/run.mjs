@@ -208,13 +208,19 @@ const shims = `
   document.addEventListener("DOMContentLoaded", () => { ${userscript} });
 `;
 
-async function open(browser, sheet, game = new FakeGame()) {
+/** What Greasemonkey 4 gives a script: only the async GM.* API, none of the GM_* functions. */
+const greasemonkeyShims = `
+  window.GM = { getValue: async () => undefined, setValue: async () => {}, xmlHttpRequest: () => {} };
+  document.addEventListener("DOMContentLoaded", () => { ${userscript} });
+`;
+
+async function open(browser, sheet, game = new FakeGame(), { manager = "tampermonkey" } = {}) {
   const context = await browser.newContext();
   const tab = await context.newPage();
   tab.on("pageerror", (error) => console.error("page error:", error));
   await tab.exposeFunction("__sheetCall", (data) => JSON.stringify(sheet.handle(JSON.parse(data))));
   await tab.exposeFunction("__gameCall", (method, url, data) => ({ status: 200, body: game.handle(method, url, data).body }));
-  await tab.addInitScript(shims);
+  await tab.addInitScript(manager === "greasemonkey" ? greasemonkeyShims : shims);
   await context.route("https://4clop.org/**", (route) => {
     const request = route.request();
     const reply = game.handle(request.method(), request.url(), request.postData());
@@ -557,6 +563,20 @@ test("troop counts that do not add up to overview's military upkeep leave the TR
   assert.match(status, /would use 10 gems, 15 gasoline but overview\.php says your military uses 0 gems, 0 gasoline/, status);
   assert.equal(sheet.get("VladihoofstockZ", "R40"), 9);          // untouched
   assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);   // everything else still synced
+  await tab.context().close();
+});
+
+test("under Greasemonkey 4 it says which manager to use instead of crashing", async (browser) => {
+  const game = new FakeGame();
+  const errors = [];
+  const tab = await open(browser, freshSheet(), game, { manager: "greasemonkey" });
+  tab.on("pageerror", (error) => errors.push(error));
+  await tab.goto("https://4clop.org/overview.php");
+  await tab.waitForSelector("#clop-sheet-sync-unsupported");
+  assert.match(await tab.textContent("#clop-sheet-sync-unsupported"), /Install Tampermonkey or Violentmonkey/);
+  await tab.waitForTimeout(500);
+  assert.deepEqual(errors, []);
+  assert.equal(game.log.length, 1, "the script made requests of its own"); // just the page load
   await tab.context().close();
 });
 

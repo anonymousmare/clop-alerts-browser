@@ -10,7 +10,10 @@ and back, so it can read that nation (see [Your other nations](#your-other-natio
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
+1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
+   in your browser (on Firefox, both are on addons.mozilla.org). **Greasemonkey 4 won't work.** It
+   only has an async API and no way for tabs to see each other's changes, which the script relies
+   on. Under Greasemonkey the script just shows a note saying so.
 2. Open `clop-sheet-sync.user.js` from this repo's **Raw** view. Tampermonkey offers to install it.
    (You can also go to Tampermonkey → *Create a new script*, paste the file in, and save.)
 3. The first time it connects to 4clop.org and to the sheet, Tampermonkey asks for permission.
