@@ -85,7 +85,12 @@ skipped, and the status line names the problem.
   price × amount × your economy's buying multiplier (1.2 State Controlled, 1.03 active Free Market,
   1.1 otherwise), the same amount the game took when you placed them.
 
-It never touches anyone else's column, the `TOTAL` column, or the `Ticks Since Recorded` row.
+Each of the Deals and Market blocks ends at the next row whose label isn't one of its own. So the
+`Total` block under Market, which repeats all the same labels, starts a block of its own and is
+never written.
+
+It never touches anyone else's column, the `TOTAL` column, the `Total` block, or the
+`Ticks Since Recorded` row.
 Cells that already hold the right value aren't rewritten. The two timestamps are always written,
 and they go last, so a failed write can never leave a fresh stamp sitting over stale numbers.
 
@@ -182,8 +187,15 @@ script. If the deployment ever has to be redone, the sheet's owner does this:
 3. Editing the existing deployment keeps the same URL. If you make a *new* deployment instead, put
    its URL in `EXEC_URL`.
 
-Older deployments without the `batch` action still work. The script notices and sends one request
-per range instead.
+Older deployments without the `batch` action still work. The script notices, remembers it for 6
+hours, and sends one request per range instead. **That's slow:** each request to Google takes
+around 5 seconds, so a sync with a lot of new numbers can take a minute. With `Code.gs` redeployed,
+any sync is 2 requests: one read and one write. Either way, the script keeps the count down.
+
+- It reads each tab once.
+- It writes each column as one stretch, carrying on across empty spacer rows.
+- It only writes cells that changed.
+- When nothing in the game changed, it doesn't contact the sheet at all.
 
 ## Tests
 
