@@ -101,6 +101,7 @@ class FakeSheet {
     return { ok: false, error: "unknown action: " + op.action };
   }
   handle(request) {
+    this.requests = (this.requests || 0) + 1;
     if (request.action === "batch") {
       if (!this.batch) return { ok: false, error: "no such tab: undefined" }; // what the old script says
       return { ok: true, results: request.ops.map((op) => this.runOne(op)) };
@@ -270,6 +271,8 @@ async function open(browser, sheet, game = new FakeGame(), { manager = "tampermo
 /** Fill the User Info form: {nation: [dashboardColumn, sheetName]}. */
 async function configure(tab, rows) {
   await tab.goto("https://4clop.org/userinfo.php");
+  // Let the form's own fill-in from the sheet finish first, so it can't land mid-typing.
+  await tab.waitForSelector("#clop-sheet-sync-form[data-guessed]", { timeout: 30000 });
   for (const [nation, [column, sheetName]] of Object.entries(rows)) {
     await tab.fill(`#clop-sheet-sync-form tr[data-nation="${nation}"] input[name="dashboardColumn"]`, column);
     await tab.fill(`#clop-sheet-sync-form tr[data-nation="${nation}"] input[name="sheetName"]`, sheetName);
@@ -724,6 +727,54 @@ test("an unknown section inside one of your deals leaves the Deals block alone",
   const status = await configure(tab, VLAD_ROWS);
   assert.match(status, /section "Offered Goods" the script does not know/, status);
   assert.equal(sheet.get("Dashboard-Stockpile", "J52"), "");
+  await tab.context().close();
+});
+
+/** The live sheet's block under Market (row 119 on): a "Total" marker, then every label again. */
+function addTotalBlock(sheet) {
+  const grid = sheet.tabs["Dashboard-Stockpile"];
+  const market = grid.findIndex((line) => line[0] === "Market");
+  const labels = grid.slice(market + 1).map((line) => [line[0] || ""]);
+  grid.push(["Total", "", "", "", "", "", "", "", "", "=SUM(...)"]);
+  for (const [label] of labels) grid.push([label, label ? 123 : "", "", "", "", "", "", "", "", label ? "=formula" : ""]);
+  return grid.length;
+}
+
+test("a Total block under Market (repeating every label) ends the Market block and is never written", async (browser) => {
+  const sheet = freshSheet();
+  const rowsBefore = addTotalBlock(sheet);
+  const total = clone(sheet.tabs["Dashboard-Stockpile"].slice(118));
+  const tab = await open(browser, sheet);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Vladihoofstock synced at .*\(\d+ cell/, status);
+  assert.doesNotMatch(status, /problem/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J86"), 132000);   // Market written
+  assert.deepEqual(sheet.tabs["Dashboard-Stockpile"].slice(118), total); // Total untouched
+  assert.equal(sheet.tabs["Dashboard-Stockpile"].length, rowsBefore);
+  await tab.context().close();
+});
+
+test("a first full sync against an endpoint without batch takes few requests", async (browser) => {
+  const sheet = freshSheet({ batch: false });
+  const tab = await open(browser, sheet);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Vladihoofstock synced at .*\(\d+ cell/, status);
+  assert.doesNotMatch(status, /problem/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);
+  // The probe for batch, 2 reads, and the writes -- spacer rows ride along instead of splitting them.
+  const writes = sheet.log.map((op) => `${op.tab}!${op.range}`);
+  assert.ok(writes.length <= 10, `${writes.length} write requests: ${writes.join(", ")}`);
+  assert.ok(sheet.requests <= 14, `${sheet.requests} requests in all`);
+  // ...and no stretch covers a labelled spacer row (Stockpiles 14, Deals 51, Market 85), the
+  // Ticks Since Recorded row 2, or a stamp (J3, W10) other than as its own last write.
+  const dashboardWrites = sheet.log.filter((op) => op.tab === "Dashboard-Stockpile");
+  for (const op of dashboardWrites) {
+    const [, from, to] = /^J(\d+):J(\d+)$/.exec(op.range).map(Number);
+    for (const row of [2, 14, 51, 85]) assert.ok(row < from || row > to, `${op.range} covers row ${row}`);
+    if (from <= 3 && to >= 3) assert.equal(op.range, "J3:J3");
+  }
+  assert.equal(sheet.log.at(-1).range.endsWith("3:J3") || sheet.log.at(-1).range === "W10:W10", true);
+  console.log(`     (${writes.length} writes, ${sheet.requests} requests: ${writes.join(" ")})`);
   await tab.context().close();
 });
 

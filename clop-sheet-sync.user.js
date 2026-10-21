@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      2.3.1
+// @version      2.3.2
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        *://*/*
 // @noframes
@@ -77,8 +77,7 @@
   const DASHBOARD_TAB = "Dashboard-Stockpile";
 
   /** Ranges read before writing. Generous, so a longer sheet is still covered. */
-  const NATION_BUILDINGS_RANGE = "A1:B140";
-  const NATION_STOCK_RANGE = "Q1:W60";
+  const NATION_RANGE = "A1:W140";
   const DASHBOARD_RANGE = "A1:AZ200";
 
   /** Pages where you usually change something; loading one always syncs (after a short debounce). */
@@ -974,10 +973,24 @@
       cells.push({ tab: DASHBOARD_TAB, column, row: blockRows.Bits, value: data.bits });
       for (const good of BLOCK_GOODS) cells.push({ tab: DASHBOARD_TAB, column, row: blockRows[good.dashboard], value: data.goods[good.game] || 0 });
     };
-    block(DEALS_MARKER, dealsAt, marketAt !== null && marketAt > (dealsAt ?? -1) ? marketAt : grid.length, deals);
-    block(MARKET_MARKER, marketAt, grid.length, market);
+    // Each block runs from its marker to the first row labelled with something that is not one of
+    // its own labels -- the other block's marker, or anything the sheet adds below (the "Total"
+    // block, which repeats every label, starts at its own "Total" row).
+    const blockEnd = (start) => {
+      if (start === null) return grid.length;
+      for (let row = start + 1; row < grid.length; row++) {
+        const label = String(cellAt(grid, row, 0) ?? "").trim();
+        if (label && !BLOCK_KNOWN.has(label)) return row;
+      }
+      return grid.length;
+    };
+    block(DEALS_MARKER, dealsAt, blockEnd(dealsAt), deals);
+    block(MARKET_MARKER, marketAt, blockEnd(marketAt), market);
     return { cells, stamps };
   }
+
+  /** Every label that may appear inside a Deals or Market block without ending it. */
+  const BLOCK_KNOWN = new Set(["Bits", ...GOODS.map((good) => good.dashboard)]);
 
   /** True when the sheet already holds exactly `want`. A number only matches a real number. */
   function sameValue(current, want) {
@@ -985,14 +998,34 @@
     return current !== undefined && current !== null && String(current) === String(want);
   }
 
-  /** Group cells into one write op per contiguous run of rows in one column. */
-  function toWriteOps(cells) {
+  /**
+   * Group cells into as few write ops as possible: one per stretch of rows in one column.
+   *
+   * Every request to the sheet costs seconds (an older endpoint has no batching, so each op is its
+   * own request), so a stretch carries on across a row between two cells being written when that
+   * row is safe to write over: `fill(tab, column, row)` returns the value to put there -- one of
+   * ours that already holds it, or "" for a spacer that is empty in our cell and in its label
+   * column -- or undefined to end the stretch. Without `fill`, only touching rows join.
+   */
+  function toWriteOps(cells, fill = () => undefined) {
     const sorted = [...cells].sort((a, b) => (a.tab < b.tab ? -1 : a.tab > b.tab ? 1 : a.column - b.column || a.row - b.row));
     const ops = [];
     let run = null;
     for (const cell of sorted) {
-      if (run && run.tab === cell.tab && run.column === cell.column && cell.row === run.end + 1) {
-        run.values.push([cell.value]);
+      let between = null;
+      if (run && run.tab === cell.tab && run.column === cell.column) {
+        between = [];
+        for (let row = run.end + 1; row < cell.row; row++) {
+          const value = fill(cell.tab, cell.column, row);
+          if (value === undefined) {
+            between = null;
+            break;
+          }
+          between.push([value]);
+        }
+      }
+      if (between) {
+        run.values.push(...between, [cell.value]);
         run.end = cell.row;
       } else {
         run = { tab: cell.tab, column: cell.column, start: cell.row, end: cell.row, values: [[cell.value]] };
@@ -1067,19 +1100,25 @@
     throw new SyncError(`could not reach the sheet (${last})`);
   }
 
-  let batchSupported = true;
+  /**
+   * An endpoint found not to understand "batch" is remembered for this long, across tabs and page
+   * loads -- otherwise every page load would spend one ~5 second request rediscovering it. After
+   * that it is tried again, so redeploying apps-script/Code.gs is picked up by itself.
+   */
+  const NO_BATCH_RECHECK_MS = 6 * 60 * 60 * 1000;
+  const batchSupported = () => !(GM_getValue("noBatchUntil", 0) > Date.now());
 
   /** Run ops in order; returns one {ok, values|error} per op. Falls back to one call per op. */
   async function runOps(ops) {
     if (!ops.length) return [];
-    if (batchSupported) {
+    if (batchSupported()) {
       try {
         const body = await callSheet({ action: "batch", ops });
         if (Array.isArray(body.results)) return body.results;
       } catch (error) {
         if (!error.definitive) throw error;
       }
-      batchSupported = false; // an older deployment: it rejects "batch" as a whole
+      GM_setValue("noBatchUntil", Date.now() + NO_BATCH_RECHECK_MS); // an older deployment: it rejects "batch" as a whole
     }
     const results = [];
     for (const op of ops) {
@@ -1099,43 +1138,57 @@
   async function sync(settings, game) {
     const { sheetName, dashboardColumn } = settings;
     const problems = [];
-    const reads = [
-      { action: "read", tab: sheetName, range: NATION_BUILDINGS_RANGE },
-      { action: "read", tab: sheetName, range: NATION_STOCK_RANGE },
+    // Two reads: the whole nation tab (buildings in A:B, the STOCK and TROOPS blocks in Q:W), and
+    // the Dashboard.
+    const [nationRead, dashboardRead] = await runOps([
+      { action: "read", tab: sheetName, range: NATION_RANGE },
       { action: "read", tab: DASHBOARD_TAB, range: DASHBOARD_RANGE },
-    ];
-    const [buildingsRead, stockRead, dashboardRead] = await runOps(reads);
+    ]);
+    const nationGrid = nationRead.ok ? nationRead.values : [];
+    const dashboardGrid = dashboardRead.ok ? dashboardRead.values : [];
 
     const cells = [];
     const stamps = [];
-    if (buildingsRead.ok && stockRead.ok) {
-      cells.push(...planBuildings(buildingsRead.values, sheetName, game.overview, problems));
-      const stock = planStock(stockRead.values, sheetName, game.overview, problems);
+    if (nationRead.ok) {
+      const fromQ = nationGrid.map((line) => (line || []).slice(STOCK_FIRST_COLUMN));
+      cells.push(...planBuildings(nationGrid, sheetName, game.overview, problems));
+      const stock = planStock(fromQ, sheetName, game.overview, problems);
       cells.push(...stock.cells);
       stamps.push(...stock.stamps);
-      cells.push(...planTroops(stockRead.values, sheetName, game, problems));
+      cells.push(...planTroops(fromQ, sheetName, game, problems));
     } else {
-      problems.push(`could not read tab ${JSON.stringify(sheetName)}: ${(buildingsRead.ok ? stockRead : buildingsRead).error}`);
+      problems.push(`could not read tab ${JSON.stringify(sheetName)}: ${nationRead.error}`);
     }
     if (dashboardRead.ok) {
-      const dashboard = planDashboard(dashboardRead.values, dashboardColumn, game, problems);
+      const dashboard = planDashboard(dashboardGrid, dashboardColumn, game, problems);
       cells.push(...dashboard.cells);
       stamps.push(...dashboard.stamps);
     } else {
       problems.push(`could not read tab ${JSON.stringify(DASHBOARD_TAB)}: ${dashboardRead.error}`);
     }
 
-    const grids = { [sheetName + "!B"]: buildingsRead.values, [sheetName + "!Q"]: stockRead.values, [DASHBOARD_TAB]: dashboardRead.values };
-    const current = (cell) => {
-      if (cell.tab === DASHBOARD_TAB) return cellAt(grids[DASHBOARD_TAB] || [], cell.row, cell.column);
-      if (cell.column === 1) return cellAt(grids[sheetName + "!B"] || [], cell.row, 1);
-      return cellAt(grids[sheetName + "!Q"] || [], cell.row, cell.column - STOCK_FIRST_COLUMN);
+    const gridOf = (tab) => (tab === DASHBOARD_TAB ? dashboardGrid : nationGrid);
+    const current = (cell) => cellAt(gridOf(cell.tab), cell.row, cell.column);
+    const key = (tab, column, row) => `${tab}|${column}|${row}`;
+    const stampKeys = new Set(stamps.map((s) => key(s.tab, s.column, s.row)));
+    const ours = new Map(cells.map((cell) => [key(cell.tab, cell.column, cell.row), cell.value]));
+    const changed = cells.filter((cell) => !stampKeys.has(key(cell.tab, cell.column, cell.row)) && !sameValue(current(cell), cell.value));
+
+    // Between two cells being written: one of ours (it gets the value it should hold anyway), or a
+    // spacer row -- empty in our cell and in its label column (A, or Q for the STOCK/TROOPS side)
+    // -- which gets "" back. A labelled row, a stamp, or anything holding a value ends the stretch.
+    const blank = (value) => value === undefined || value === null || value === "";
+    const fill = (tab, column, row) => {
+      if (stampKeys.has(key(tab, column, row))) return undefined;
+      if (ours.has(key(tab, column, row))) return ours.get(key(tab, column, row));
+      const grid = gridOf(tab);
+      if (row >= grid.length) return undefined;
+      const labelColumn = tab !== DASHBOARD_TAB && column >= STOCK_FIRST_COLUMN ? STOCK_FIRST_COLUMN : 0;
+      return blank(cellAt(grid, row, column)) && blank(cellAt(grid, row, labelColumn)) ? "" : undefined;
     };
-    const stampKeys = new Set(stamps.map((s) => `${s.tab}|${s.column}|${s.row}`));
-    const changed = cells.filter((cell) => !stampKeys.has(`${cell.tab}|${cell.column}|${cell.row}`) && !sameValue(current(cell), cell.value));
 
     // Values first, timestamps last: a failed write can then never leave a fresh stamp over stale numbers.
-    const ops = [...toWriteOps(changed), ...toWriteOps(stamps)];
+    const ops = [...toWriteOps(changed, fill), ...toWriteOps(stamps)];
     const results = await runOps(ops);
     results.forEach((result, i) => {
       if (!result.ok) problems.push(`writing ${ops[i].tab}!${ops[i].range} failed: ${result.error}`);
@@ -1677,7 +1730,9 @@
       runRound({ force: true });
     });
     anchor.parentNode.insertBefore(form, anchor);
-    guessNames(table).catch((error) => console.warn("[CLOP Sheet Sync] could not guess sheet names:", error));
+    guessNames(table)
+      .catch((error) => console.warn("[CLOP Sheet Sync] could not guess sheet names:", error))
+      .finally(() => { form.dataset.guessed = "1"; });
   }
 
   /**
