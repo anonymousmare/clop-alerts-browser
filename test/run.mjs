@@ -371,6 +371,8 @@ test("every nation in the empire gets its own row and is synced by switching and
   const status = await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
   assert.match(status, /Vladihoofstock synced at/, status);
   assert.match(status, /Lanathesis synced at/, status);
+  // You pressed it while looking, so you were told, and told when it finished.
+  await tab.waitForFunction(() => /Done! Synced/.test(document.getElementById("clop-sheet-sync-wait")?.textContent || ""));
   assert.equal(sheet.get("Dashboard-Stockpile", "J19"), 20868);   // Vladihoofstock's apples
   assert.equal(sheet.get("Dashboard-Stockpile", "M19"), 11111);   // Lanathesis's apples
   assert.equal(sheet.get("LanathesisZ", "R11"), 11111);
@@ -380,24 +382,67 @@ test("every nation in the empire gets its own row and is synced by switching and
   await tab.context().close();
 });
 
-test("a form submitted while another nation is being read is held, then sent with its button", async (browser) => {
+test("tabbing in mid-visit says Working! (and lets nothing through), then Done! Synced", async (browser) => {
   const game = new FakeGame({ nations: [VLAD, LANA] });
   const tab = await open(browser, freshSheet(), game);
-  await tab.goto("https://4clop.org/userinfo.php");
-  await tab.evaluate(() => GM_setValue("rotation", { home: { id: 16, name: "Vladihoofstock" }, started: Date.now(), beat: Date.now() }));
-  await tab.click('input[name="changeemail"]');
-  await tab.waitForSelector("#clop-sheet-sync-wait");
-  await tab.waitForTimeout(600);
-  assert.equal(game.log.filter((entry) => entry.method === "POST").length, 0, "the form went through mid-visit");
+  await configure(tab, VLAD_ROWS);
+  await tab.goto("https://4clop.org/news.php");
+  // Another tab is reading Lanathesis right now.
+  await tab.evaluate(() => {
+    GM_setValue("lock", Date.now() + 30000);
+    GM_setValue("rotation", { home: { id: 16, name: "Vladihoofstock" }, current: "Lanathesis", started: Date.now(), beat: Date.now() });
+  });
+  await tab.waitForFunction(() => /Working! Don't do anything/.test(document.getElementById("clop-sheet-sync-wait")?.textContent));
+  assert.match(await tab.textContent("#clop-sheet-sync-wait"), /reading Lanathesis\. You'll be back on Vladihoofstock/);
+  const posts = game.log.filter((entry) => entry.method === "POST").length;
+  await tab.evaluate(() => document.forms[0] && document.forms[0].requestSubmit());
+  await tab.waitForTimeout(500);
+  assert.equal(game.log.filter((entry) => entry.method === "POST").length, posts, "a form went through mid-visit");
 
+  // Switched back; the sheet is still being written.
   await tab.evaluate(() => GM_setValue("rotation", null));
-  await tab.waitForFunction(() => !document.getElementById("clop-sheet-sync-wait"));
-  await tab.waitForLoadState();
-  await tab.waitForTimeout(300);
-  const posts = game.log.filter((entry) => entry.method === "POST");
-  assert.equal(posts.length, 1);
-  assert.equal(posts[0].name, "userinfo.php");
-  assert.equal(posts[0].form.changeemail, "Change Email");
+  await tab.waitForFunction(() => document.getElementById("clop-sheet-sync-wait")?.dataset.kind === "writing");
+  // The round ends.
+  await tab.evaluate(() => GM_setValue("lock", 0));
+  await tab.waitForFunction(() => /Done! Synced/.test(document.getElementById("clop-sheet-sync-wait")?.textContent));
+  await tab.waitForFunction(() => !document.getElementById("clop-sheet-sync-wait"), null, { timeout: 5000 });
+  await tab.context().close();
+});
+
+test("while a 4clop tab is on screen, timed rounds leave the other nations alone", async (browser) => {
+  const game = new FakeGame({ nations: [VLAD, LANA] });
+  const tab = await open(browser, freshSheet(), game);
+  await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
+  const switches = () => game.log.filter((entry) => entry.form.switchnation_id).length;
+  assert.equal(switches(), 2); // the Save above counts as a manual sync
+  await tab.goto("https://4clop.org/news.php");
+  // Make both the round and Lanathesis overdue, then let the timer run one.
+  await tab.evaluate(() => {
+    GM_setValue("round", { ...GM_getValue("round", {}), lastAttempt: 0 });
+    const state = GM_getValue("state", {});
+    state.Lanathesis.lastRead = 0;
+    GM_setValue("state", state);
+  });
+  const before = game.log.length;
+  await tab.waitForFunction((n) => GM_getValue("round", {}).lastAttempt > 0 && !(GM_getValue("lock", 0) > Date.now()), before, { timeout: 30000 });
+  assert.ok(game.log.length > before + 1, "no timed round ran");
+  assert.equal(switches(), 2, "a timed round switched nations while you were looking");
+  await tab.context().close();
+});
+
+test("with no 4clop tab on screen, timed rounds visit the other nations too", async (browser) => {
+  const sheet = freshSheet();
+  const game = new FakeGame({ nations: [VLAD, LANA] });
+  const tab = await open(browser, sheet, game);
+  await tab.goto("https://example.com/");
+  await tab.evaluate(() => GM_setValue("settings", {
+    Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "VladihoofstockZ" },
+    Lanathesis: { dashboardColumn: "Lanathesis(Z)", sheetName: "LanathesisZ" },
+  }));
+  await tab.reload();
+  await tab.waitForFunction(() => (GM_getValue("state", {}).Lanathesis || {}).checkedAt, null, { timeout: 30000 });
+  assert.equal(sheet.get("LanathesisZ", "R11"), 11111);
+  assert.equal(game.active, VLAD.id);
   await tab.context().close();
 });
 

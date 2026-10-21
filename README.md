@@ -84,7 +84,8 @@ and they go last, so a failed write can never leave a fresh stamp sitting over s
   no tabs open at all; that would take a full browser extension.
 - On pages where you usually change things (Overview, Deals, Marketplace, My Offers, Transfers,
   Actions, …), on every page load, apart from a 10-second debounce.
-- The nation you're on syncs every round. Your other nations are visited at most every 5 minutes.
+- The nation you're on syncs every round. Your other nations are visited only when you press
+  **Sync now**, or, at most every 5 minutes, while no 4clop.org tab is on screen.
 - Every sync reads the game. The sheet is only written when something has actually changed. If
   nothing has changed, it leaves the sheet alone, but still refreshes the timestamps every
   30 minutes.
@@ -114,13 +115,20 @@ switches your session to each one, reads its overview, deals and group forces, a
 back. It's the same thing the game's nation dropdown does. All the reading happens first and the
 sheet is written afterwards, so you're away from your own nation for a few seconds at most.
 
-So nothing you do lands on the wrong nation during those seconds:
+Because that switches your session, it only happens:
 
-- every 4clop.org tab shows a "reading your other nations" overlay;
-- a form you submit is **held**, then sent with the button you clicked once your nation is back;
-- a page that loaded during the switch reloads, so you never act on another nation's page;
-- if the tab doing the switch is closed half-way, the next sync from any tab switches you back
-  before doing anything else.
+- when you press **Sync now** (or **Save Sheet Settings**), or
+- while no 4clop.org tab is on screen. 4clop.org tabs you're looking at check in every couple of
+  seconds, and while one has, the timed syncs only do the nation you're on.
+
+If you tab into 4clop.org while it's in the middle of one anyway, the page is covered with
+**"Working! Don't do anything…"**. It names the nation it's reading, and anything you try to submit
+is cancelled, because it would land on that nation. Once you're switched back you get
+**"Done! Synced ✓"** (or "Synced, with problems", with the details in the badge). A page you
+loaded in the middle of it was showing the other nation, so it reloads instead.
+
+If the tab doing the switch is closed half-way, the next sync from any tab switches you back before
+doing anything else.
 
 ## Safety checks
 
@@ -160,7 +168,8 @@ game remembers which nation the session is on, like the real one. The tests cove
 
 - every block above, and that nothing outside your own cells changes;
 - syncing two nations by switching and switching back;
-- holding a form submitted mid-switch, and recovering from a switch that was abandoned;
+- only visiting other nations on Sync now or when no 4clop.org tab is on screen;
+- the "Working!" and "Done!" notices, and recovering from a switch that was abandoned;
 - the one-second spacing, and syncing from a tab on another site;
 - the badge;
 - the no-`batch` fallback, a wrong column name, a duplicated label, troop counts that don't match

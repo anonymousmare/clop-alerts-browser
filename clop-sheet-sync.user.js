@@ -30,9 +30,10 @@
  *      outgoing deals) and the Market block (goods on your sell orders, bits held by your buy orders).
  *
  * Both names are set per nation on User Info (userinfo.php). Every nation on your login that has
- * them is synced: the script switches the session to each in turn, reads it, and switches back
- * (see visitOthers -- 4clop tabs hold any form you submit until it is back). Apart from that
- * switch, nothing is ever done in the game: the script only reads pages. Every sheet cell is found by looking its label up, never by row number,
+ * them is synced: the script switches the session to each in turn, reads it, and switches back --
+ * only on Sync now, or while no 4clop.org tab is on screen (see visitOthers). Apart from that
+ * switch, nothing is ever done in the game: the script only reads pages. Every sheet cell is found
+ * by looking its label up, never by row number,
  * and a region whose labels do not line up is skipped and reported instead of guessed at.
  */
 
@@ -77,6 +78,11 @@
   const LOCK_MS = 30 * 1000;
   /** A nation visit that has not checked in for this long is a crashed one, and is undone. */
   const ROTATION_STALE_MS = 15 * 1000;
+  /**
+   * A 4clop.org tab that was on screen this recently means you are looking at the game, so other
+   * nations are left alone unless you press Sync now. On-screen tabs check in every 2 seconds.
+   */
+  const LOOKING_MS = 5 * 1000;
   /** At most one request a second to 4clop.org, as the game's host asks. */
   const GAME_REQUEST_GAP_MS = 1000;
 
@@ -1055,18 +1061,20 @@
    * Read each of `others` by switching the session to it, then switch back to `home`.
    *
    * The game keeps one active nation per session, so this is the only way to see another nation's
-   * overview, deals and forces without your password. Everything is read first and the sheet is
-   * written afterwards, so the session is away from `home` for a few page loads only. While it is,
-   * the "rotation" record is set and every 4clop.org tab holds submitted forms and reloads pages
-   * loaded in the meantime (installGuard). If switching back fails, the record stays, and the next
-   * round -- from any tab -- switches back before anything else.
+   * overview, deals and forces without your password. It only happens on Sync now or while no
+   * 4clop.org tab is on screen (see runRound). Everything is read first and the sheet is written
+   * afterwards, so the session is away from `home` for a few page loads only. While it is, the
+   * "rotation" record is set, and a 4clop.org tab you bring up says to wait (installGuard). If
+   * switching back fails, the record stays, and the next round -- from any tab -- switches back
+   * before anything else.
    */
   async function visitOthers(home, others) {
-    rotating = { home, started: Date.now(), beat: Date.now() };
+    rotating = { home, current: null, started: Date.now(), beat: Date.now() };
     GM_setValue("rotation", rotating);
     const results = [];
     try {
       for (const nation of others) {
+        rotating.current = nation.name;
         try {
           const read = await readNation(await gameRequest("overview.php", { switchnation_id: nation.id }));
           if (read.name !== nation.name) throw new SyncError(`switching to ${nation.name} landed on ${read.name}`);
@@ -1116,10 +1124,14 @@
       rememberNations(home.overview.nations);
       const homeRef = home.overview.nations.find((nation) => nation.name === home.name) || { id: null, name: home.name };
 
+      // Other nations mean switching your session, so only on Sync now, or while you are not
+      // looking at the game.
       const reads = [{ name: home.name, read: home }];
-      const others = home.overview.nations.filter((nation) =>
-        nation.name !== home.name && nation.id !== null && isConfigured(settings[nation.name]) &&
-        (force || Date.now() - (stateFor(nation.name).lastRead || 0) >= OTHER_NATIONS_INTERVAL_MS));
+      const others = force || !lookingAtGame()
+        ? home.overview.nations.filter((nation) =>
+          nation.name !== home.name && nation.id !== null && isConfigured(settings[nation.name]) &&
+          (force || Date.now() - (stateFor(nation.name).lastRead || 0) >= OTHER_NATIONS_INTERVAL_MS))
+        : [];
       if (others.length && homeRef.id !== null) reads.push(...(await visitOthers(homeRef, others)));
 
       const api = await readApi();
@@ -1167,69 +1179,107 @@
   }
 
   // ------------------------------------------------------------------------------------------
-  // On 4clop.org: hold forms while another nation is being read
+  // On 4clop.org: "Working! Don't do anything..." while another nation is being read
+
+  /** True while any 4clop.org tab is on screen (they check in every 2 seconds; see main). */
+  const lookingAtGame = () => Date.now() - GM_getValue("lastSeen", 0) < LOOKING_MS;
 
   /**
-   * While the session is visiting another nation, a form submitted in any 4clop.org tab would act
-   * on the wrong nation. So: submits are held and re-sent (with the button you clicked) once the
-   * session is back, and a page loaded during a visit -- which shows the other nation -- reloads.
-   * Returns true when it is reloading this page.
+   * Other nations are only visited on Sync now, or while no 4clop.org tab is on screen. If you bring
+   * one up during a visit anyway, the page is covered with "Working! Don't do anything..." -- a
+   * click or a form now would land on the other nation, so submits are cancelled too -- and once
+   * the round is over it says "Done! Synced". A page loaded during the visit shows the other
+   * nation, so it reloads instead. Returns true when it is reloading this page.
    */
   function installGuard() {
     const last = GM_getValue("lastRotation", null);
     const loadedAt = performance.timeOrigin;
     if (!rotationRecord() && last && loadedAt >= last.started - 5000 && loadedAt <= last.ended) {
+      sessionStorage.setItem("clop-sheet-sync-finishing", "1");
       location.replace(location.href);
       return true;
     }
-    let reloadWhenClear = !!rotationRecord();
-    let held = null;
+    const loadedDuringVisit = !!rotationRecord();
+    // "working" while the visit runs, "writing" from switching back until the round ends.
+    let phase = sessionStorage.getItem("clop-sheet-sync-finishing") ? "writing" : null;
+    sessionStorage.removeItem("clop-sheet-sync-finishing");
 
     document.addEventListener("submit", (event) => {
       if (!rotationRecord()) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      held = { form: event.target, submitter: event.submitter || null };
-      showWait();
     }, true);
 
-    setInterval(() => {
+    const tick = () => {
       const record = rotationRecord();
       if (record) {
-        showWait();
+        if (phase !== "working") document.activeElement?.blur();
+        phase = "working";
+        showNotice("working", record);
         // Nobody is finishing the visit (its tab closed): switch back from here.
         if (Date.now() - record.beat > ROTATION_STALE_MS) runRound({ force: true });
         return;
       }
-      hideWait();
-      if (reloadWhenClear) {
-        reloadWhenClear = false;
-        location.replace(location.href);
-      } else if (held) {
-        const { form, submitter } = held;
-        held = null;
-        if (submitter && submitter.form === form) form.requestSubmit(submitter);
-        else form.requestSubmit();
+      if (phase === "working") {
+        if (loadedDuringVisit) {
+          showNotice("reloading");
+          sessionStorage.setItem("clop-sheet-sync-finishing", "1");
+          location.replace(location.href);
+          phase = null;
+          return;
+        }
+        phase = "writing";
       }
-    }, 250);
-    if (reloadWhenClear) showWait();
+      if (phase === "writing") {
+        if (syncing()) {
+          showNotice("writing");
+        } else {
+          phase = null;
+          showNotice(summary().level === "ok" ? "done" : "done-problems");
+          setTimeout(() => phase === null && hideNotice(), 3000);
+        }
+      }
+    };
+    tick();
+    setInterval(tick, 250);
     return false;
   }
 
-  function showWait() {
-    if (document.getElementById("clop-sheet-sync-wait")) return;
-    const record = rotationRecord();
-    const wait = document.createElement("div");
-    wait.id = "clop-sheet-sync-wait";
-    wait.style.cssText =
-      "position:fixed;inset:0;z-index:10000;background:rgba(20,22,25,.72);display:flex;align-items:center;" +
-      "justify-content:center;color:#fff;font:15px/1.5 sans-serif;text-align:center;padding:24px";
-    wait.textContent =
-      `Sheet Sync is reading your other nations for a few seconds. Anything you submit now is sent once ` +
-      `${record ? record.home.name : "your nation"} is active again.`;
-    document.body.appendChild(wait);
+  const NOTICES = {
+    working: (record) => [
+      "Working! Don't do anything...",
+      record && record.current
+        ? `Sheet Sync is reading ${record.current}. You'll be back on ${record.home.name} in a few seconds.`
+        : "Sheet Sync is reading your other nations. This takes a few seconds.",
+    ],
+    reloading: () => ["Done! Reloading this page...", "It was loaded while another nation was active."],
+    writing: () => ["Almost done...", "Back on your nation. Writing the sheet."],
+    done: () => ["Done! Synced ✓", ""],
+    "done-problems": () => ["Done! Synced, with problems", "The badge in the corner lists them."],
+  };
+
+  /** "working" covers the page and blocks clicks; the rest are a small note at the top. */
+  function showNotice(kind, record) {
+    const [title, detail] = NOTICES[kind](record);
+    let notice = document.getElementById("clop-sheet-sync-wait");
+    if (!notice) {
+      notice = el("div");
+      notice.id = "clop-sheet-sync-wait";
+      notice.append(el("div", "font:bold 22px/1.3 sans-serif"), el("div", "margin-top:6px;font:14px/1.4 sans-serif;opacity:.85"));
+      document.body.appendChild(notice);
+    }
+    notice.style.cssText = kind === "working" || kind === "reloading"
+      ? "position:fixed;inset:0;z-index:10000;background:rgba(20,22,25,.8);display:flex;flex-direction:column;" +
+        "align-items:center;justify-content:center;color:#fff;text-align:center;padding:24px"
+      : "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:10000;background:#2b3035;color:#fff;" +
+        `padding:10px 18px;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.6);text-align:center;` +
+        `border-top:4px solid ${kind === "done" ? COLORS.ok : kind === "done-problems" ? COLORS.warn : COLORS.busy}`;
+    notice.dataset.kind = kind;
+    notice.children[0].textContent = title;
+    notice.children[1].textContent = detail;
+    notice.children[1].style.display = detail ? "" : "none";
   }
-  const hideWait = () => document.getElementById("clop-sheet-sync-wait")?.remove();
+  const hideNotice = () => document.getElementById("clop-sheet-sync-wait")?.remove();
 
   // ------------------------------------------------------------------------------------------
   // The badge
@@ -1427,6 +1477,11 @@
       GM_setValue("lastGameRequest", Math.max(GM_getValue("lastGameRequest", 0), answered));
       if (location.pathname.startsWith("/api/") || !isLoggedIn(document)) return;
       rememberNations(navbarNations(document).all);
+      // Tell other tabs you are looking at the game, so they leave your other nations alone.
+      const markSeen = () => document.visibilityState === "visible" && GM_setValue("lastSeen", Date.now());
+      markSeen();
+      document.addEventListener("visibilitychange", markSeen);
+      setInterval(markSeen, 2000);
       if (installGuard()) return;
       if (location.pathname.endsWith("userinfo.php")) addSettingsForm();
       render();
