@@ -148,6 +148,17 @@ loaded in the middle of it was showing the other nation, so it reloads instead.
 If the tab doing the switch is closed half-way, the next sync from any tab switches you back before
 doing anything else.
 
+## Other userscripts
+
+It runs fine alongside [4clopX](https://github.com/luftkrieghoofler/4clopX), which adds its own
+items (a ⚙ settings link, a countdown) to the front of the game's top bar. The script finds your
+nation name where the game itself puts it, just before "Server time:", so those items aren't
+mistaken for it. Settings an older version saved under "⚙" by that mistake are moved to your nation
+automatically.
+
+The one-request-a-second limit only covers this script's requests and your page loads. It can't see
+requests another userscript makes. 4clopX's live updates, for example, are on top of it.
+
 ## Safety checks
 
 It refuses to write anything when:

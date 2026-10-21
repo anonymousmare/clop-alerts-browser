@@ -228,11 +228,32 @@ const greasemonkeyShims = `
   document.addEventListener("DOMContentLoaded", () => { ${userscript} });
 `;
 
-async function open(browser, sheet, game = new FakeGame(), { manager = "tampermonkey", flags = {} } = {}) {
+/**
+ * What 4clopX 0.9.1 does to the navbar (its src/main.js), at document-end -- before this script, which
+ * runs at document-idle: a "⚙" settings link and a hidden countdown item at the front of navbar-right.
+ */
+const fourClopX = () => document.addEventListener("DOMContentLoaded", () => {
+  const navRight = document.querySelector("nav.navbar ul.navbar-right");
+  if (!navRight) return;
+  const gear = document.createElement("li");
+  const link = document.createElement("a");
+  link.setAttribute("style", "cursor: pointer;");
+  link.setAttribute("title", "4clopX settings");
+  link.textContent = "⚙";
+  gear.appendChild(link);
+  navRight.insertBefore(gear, navRight.firstElementChild);
+  const countdown = document.createElement("li");
+  countdown.className = "clop-live-countdown-home";
+  countdown.style.display = "none";
+  navRight.insertBefore(countdown, navRight.firstChild);
+});
+
+async function open(browser, sheet, game = new FakeGame(), { manager = "tampermonkey", flags = {}, with4clopX = false } = {}) {
   const context = await browser.newContext();
   const tab = await context.newPage();
   tab.on("pageerror", (error) => console.error("page error:", error));
   await tab.addInitScript((value) => { window.__flags = value; }, flags);
+  if (with4clopX) await tab.addInitScript(fourClopX);
   await tab.exposeFunction("__sheetCall", (data) => JSON.stringify(sheet.handle(JSON.parse(data))));
   await tab.exposeFunction("__gameCall", (method, url, data) => ({ status: 200, body: game.handle(method, url, data, { viaManager: true }).body }));
   await tab.addInitScript(manager === "greasemonkey" ? greasemonkeyShims : shims);
@@ -459,6 +480,49 @@ test("from another site with a cookieless manager it says why, and the badge ope
   await tab.reload();
   await tab.waitForSelector("#clop-sheet-sync-badge");
   assert.doesNotMatch(await tab.textContent("#clop-sheet-sync-badge"), /Sync now/);
+  await tab.context().close();
+});
+
+test("alongside 4clopX, its ⚙ in the navbar is not taken for the nation", async (browser) => {
+  const sheet = freshSheet();
+  sheet.set("Dashboard-Stockpile", "J21", 0);
+  const tab = await open(browser, sheet, new FakeGame(), { with4clopX: true });
+  await tab.goto("https://4clop.org/userinfo.php");
+  assert.equal(await tab.textContent("nav.navbar ul.navbar-right > li:nth-child(2)"), "⚙"); // 4clopX really is there
+  const rows = await tab.$$eval("#clop-sheet-sync-form tr[data-nation]", (trs) => trs.map((tr) => tr.dataset.nation));
+  assert.deepEqual(rows, ["Vladihoofstock"]);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Vladihoofstock synced at/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J21"), 29816);
+  await tab.context().close();
+});
+
+test("settings an older version saved under 4clopX's ⚙ move to the nation by themselves", async (browser) => {
+  const sheet = freshSheet();
+  sheet.set("Dashboard-Stockpile", "J21", 0);
+  const tab = await open(browser, sheet, new FakeGame(), { with4clopX: true });
+  await tab.goto("https://4clop.org/news.php");
+  await tab.evaluate(() => {
+    GM_setValue("settings", { "⚙": { dashboardColumn: "Vladihoofstock(Z)", sheetName: "Vladihoofstock(Z)" } });
+    GM_setValue("state", { "⚙": { error: 'the game lists no nation called "⚙"' } });
+    GM_setValue("round", {});
+  });
+  await tab.reload();
+  await tab.waitForFunction(() => (GM_getValue("state", {}).Vladihoofstock || {}).checkedAt, null, { timeout: 30000 });
+  assert.deepEqual(Object.keys(await tab.evaluate(() => GM_getValue("settings", {}))), ["Vladihoofstock"]);
+  assert.deepEqual(Object.keys(await tab.evaluate(() => GM_getValue("state", {}))), ["Vladihoofstock"]);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J21"), 29816);
+  await tab.context().close();
+});
+
+test("settings under a real-looking name the game doesn't list are reported, not moved", async (browser) => {
+  const tab = await open(browser, freshSheet());
+  await tab.goto("https://4clop.org/news.php");
+  await tab.evaluate(() => GM_setValue("settings", { "Old Nation": { dashboardColumn: "LePone(Z)", sheetName: "Vladihoofstock(Z)" } }));
+  await tab.reload();
+  await tab.waitForFunction(() => (GM_getValue("state", {})["Old Nation"] || {}).error, null, { timeout: 30000 });
+  assert.match(await tab.evaluate(() => GM_getValue("state", {})["Old Nation"].error), /lists no nation called "Old Nation".*Vladihoofstock/);
+  assert.deepEqual(Object.keys(await tab.evaluate(() => GM_getValue("settings", {}))), ["Old Nation"]);
   await tab.context().close();
 });
 
