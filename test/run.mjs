@@ -134,10 +134,12 @@ const overviewFor = (nation) => nation.id === VLAD.id
     .replace('<span class="text-success">20,868</span>', '<span class="text-success">11,111</span>');
 
 class FakeGame {
-  constructor({ nations = [VLAD], loggedOut = false, extraForces = false, deals = (html) => html } = {}) {
+  constructor({ nations = [VLAD], loggedOut = false, extraForces = false, deals = (html) => html, managerCookieless = false } = {}) {
     this.nations = nations;
     this.active = nations[0].id;
     this.loggedOut = loggedOut;
+    // As Firefox can: the userscript manager's own requests arrive without the 4clop.org cookie.
+    this.managerCookieless = managerCookieless;
     this.extraForces = extraForces;
     this.deals = deals;
     this.log = [];
@@ -160,10 +162,13 @@ class FakeGame {
     return html;
   }
   /** Answer one request: {contentType, body}. A POSTed switchnation_id switches, as allfunctions.php does. */
-  handle(method, url, body) {
+  handle(method, url, body, { viaManager = false } = {}) {
     const name = new URL(url).pathname.replace(/^\//, "");
     const form = new URLSearchParams(body || "");
-    if (name.endsWith(".php")) this.log.push({ at: Date.now(), method, name, form: Object.fromEntries(form) });
+    if (name.endsWith(".php")) this.log.push({ at: Date.now(), method, name, form: Object.fromEntries(form), viaManager });
+    if (viaManager && this.managerCookieless && name !== "api/public/v1.php") {
+      return { contentType: "text/html", body: this.page("Login", "<center>Please log in.</center>", { loggedIn: false }) };
+    }
     const switchTo = parseInt(form.get("switchnation_id"), 10);
     if (method === "POST" && this.nations.some((nation) => nation.id === switchTo)) this.active = switchTo;
 
@@ -219,7 +224,7 @@ async function open(browser, sheet, game = new FakeGame(), { manager = "tampermo
   const tab = await context.newPage();
   tab.on("pageerror", (error) => console.error("page error:", error));
   await tab.exposeFunction("__sheetCall", (data) => JSON.stringify(sheet.handle(JSON.parse(data))));
-  await tab.exposeFunction("__gameCall", (method, url, data) => ({ status: 200, body: game.handle(method, url, data).body }));
+  await tab.exposeFunction("__gameCall", (method, url, data) => ({ status: 200, body: game.handle(method, url, data, { viaManager: true }).body }));
   await tab.addInitScript(manager === "greasemonkey" ? greasemonkeyShims : shims);
   await context.route("https://4clop.org/**", (route) => {
     const request = route.request();
@@ -406,6 +411,57 @@ test("User Info fills in each nation's column and tab from the sheet when they a
   const status = await waitForResult(tab, 2);
   assert.match(status, /Vladihoofstock synced at/, status);
   assert.match(status, /Lanathesis synced at/, status);
+  await tab.context().close();
+});
+
+test("on 4clop pages it reads the game itself, so a manager that drops the cookie doesn't stop it", async (browser) => {
+  const sheet = freshSheet();
+  sheet.set("Dashboard-Stockpile", "J21", 0);
+  const game = new FakeGame({ managerCookieless: true });
+  const tab = await open(browser, sheet, game);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Vladihoofstock synced at/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J21"), 29816);
+  assert.ok(game.log.every((entry) => !entry.viaManager), "a game request went through the manager from a 4clop page");
+  await tab.context().close();
+});
+
+test("from another site with a cookieless manager it says why, and the badge opens itself", async (browser) => {
+  const game = new FakeGame({ managerCookieless: true });
+  const tab = await open(browser, freshSheet(), game);
+  await tab.goto("https://example.com/");
+  await tab.evaluate(() => GM_setValue("settings", { Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "Vladihoofstock(Z)" } }));
+  await tab.reload();
+  await tab.waitForFunction(() => GM_getValue("round", {}).loggedOut === "offsite", null, { timeout: 30000 });
+  // The next 4clop.org page shows it without being asked. Copy the shared storage across origins.
+  const store = await tab.evaluate(() => localStorage.getItem("__gm"));
+  await tab.goto("https://4clop.org/news.php");
+  await tab.evaluate((value) => {
+    const all = JSON.parse(value);
+    all.round = { ...all.round, lastAttempt: Date.now() }; // no fresh round, just the stored result
+    localStorage.setItem("__gm", JSON.stringify(all));
+  }, store);
+  await tab.reload();
+  await tab.waitForFunction(() => /Sync now/.test(document.getElementById("clop-sheet-sync-badge")?.textContent || ""));
+  assert.match(await tab.textContent("#clop-sheet-sync-badge"), /isn't sending your 4clop\.org cookie/);
+  // Collapsing marks it seen: it stays collapsed after a reload.
+  await tab.click("#clop-sheet-sync-badge button[title='Collapse']");
+  await tab.reload();
+  await tab.waitForSelector("#clop-sheet-sync-badge");
+  assert.doesNotMatch(await tab.textContent("#clop-sheet-sync-badge"), /Sync now/);
+  await tab.context().close();
+});
+
+test("Save warns next to a row whose column or tab is not in the sheet", async (browser) => {
+  const tab = await open(browser, freshSheet());
+  await configure(tab, { Vladihoofstock: ["Vladihoofstock", "VladihoofstockZ"] });
+  const note = () => tab.textContent('#clop-sheet-sync-form tr[data-nation="Vladihoofstock"] .clop-guess');
+  await tab.waitForFunction(() => /no tab/.test(document.querySelector(".clop-guess")?.textContent || ""), null, { timeout: 30000 });
+  assert.match(await note(), /no column named "Vladihoofstock" in row 1 of Dashboard-Stockpile/);
+  assert.match(await note(), /no tab named "VladihoofstockZ"/);
+
+  await configure(tab, VLAD_ROWS);
+  await tab.waitForFunction(() => /found in the sheet/.test(document.querySelector(".clop-guess")?.textContent || ""), null, { timeout: 30000 });
   await tab.context().close();
 });
 
