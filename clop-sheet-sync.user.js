@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      2.2.0
+// @version      2.3.0
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        *://*/*
 // @noframes
@@ -289,6 +289,18 @@
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  /**
+   * `promise`, or a rejection after `ms`. A userscript manager's request can go quiet without ever
+   * calling onload, onerror or ontimeout; this makes sure that can't stall a sync forever.
+   */
+  function withDeadline(promise, ms, message) {
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new SyncError(message)), ms);
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+  }
+
   function parseHtml(html) {
     return new DOMParser().parseFromString(html, "text/html");
   }
@@ -304,39 +316,71 @@
    */
   async function paceGame() {
     for (;;) {
-      const wait = GM_getValue("lastGameRequest", 0) + GAME_REQUEST_GAP_MS - Date.now();
+      // A stamp that is not a number, or lies in the future (a clock that jumped, a browser that
+      // reports page timings oddly), counts as "just now" -- so this never waits more than a gap.
+      const stored = Number(GM_getValue("lastGameRequest", 0)) || 0;
+      const last = Math.min(stored, Date.now());
+      const wait = last + GAME_REQUEST_GAP_MS - Date.now();
       if (wait <= 0) break;
-      await sleep(wait);
+      heartbeat();
+      await sleep(Math.min(wait, GAME_REQUEST_GAP_MS));
     }
     GM_setValue("lastGameRequest", Date.now());
   }
 
+  /** What the round is doing right now, so a sync that stops can say where. */
+  function step(text) {
+    saveRound({ step: text });
+    heartbeat();
+  }
+
   /** GET `path` from the game, or POST `form` to it, with your 4clop.org session cookie. */
   async function gameRequest(path, form) {
+    step(`waiting to ask 4clop.org for ${path}`);
     await paceGame();
-    heartbeat();
+    step(`asking 4clop.org for ${path}${form && form.switchnation_id ? ` (switching nation)` : ""}`);
     if (ON_GAME) {
       // On the game's own pages, ask the way the page itself would: same-origin, with your login
-      // cookie guaranteed. A userscript manager's background request may not carry it (Firefox).
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      // cookie. A userscript manager's background request may not carry it (Firefox). If this way
+      // fails outright -- Firefox runs userscripts in a sandbox that can refuse it -- fall back.
       try {
-        const response = await fetch(`${GAME_ORIGIN}/${path}`, {
-          method: form ? "POST" : "GET",
-          body: form ? new URLSearchParams(form) : undefined,
-          credentials: "same-origin",
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        if (!response.ok) throw new SyncError(`${path} answered HTTP ${response.status}`);
-        return await response.text();
+        return await pageFetch(path, form);
       } catch (error) {
-        if (error instanceof SyncError) throw error;
-        throw new SyncError(error.name === "AbortError" ? `4clop.org timed out (${path})` : `could not reach 4clop.org (${path})`);
-      } finally {
-        clearTimeout(timer);
+        if (error.httpStatus) throw error;
+        console.warn(`[CLOP Sheet Sync] fetching ${path} from the page failed (${error.message}); trying the userscript manager`);
+        saveRound({ pageFetchFailed: `${error.message}` });
       }
     }
+    return withDeadline(managerRequest(path, form), REQUEST_TIMEOUT_MS + 5000, `4clop.org never answered (${path})`);
+  }
+
+  async function pageFetch(path, form) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await withDeadline(fetch(`${GAME_ORIGIN}/${path}`, {
+        method: form ? "POST" : "GET",
+        body: form ? new URLSearchParams(form).toString() : undefined,
+        headers: form ? { "Content-Type": "application/x-www-form-urlencoded" } : {},
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: controller.signal,
+      }), REQUEST_TIMEOUT_MS + 5000, `4clop.org never answered (${path})`);
+      if (!response.ok) {
+        const error = new SyncError(`${path} answered HTTP ${response.status}`);
+        error.httpStatus = response.status;
+        throw error;
+      }
+      return await response.text();
+    } catch (error) {
+      if (error instanceof SyncError) throw error;
+      throw new SyncError(error.name === "AbortError" ? `4clop.org timed out (${path})` : `${error.name || "error"}: ${error.message || error}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function managerRequest(path, form) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: form ? "POST" : "GET",
@@ -967,13 +1011,16 @@
   async function callSheet(payload) {
     const started = Date.now();
     let last = "no attempt made";
+    const what = payload.action === "batch"
+      ? `${payload.ops.length} range(s)`
+      : `${payload.tab}!${payload.range}`;
     for (const delay of RETRY_DELAYS) {
       if (Date.now() - started > SHEET_DEADLINE_MS) break;
       await sleep(delay * 1000);
-      heartbeat();
+      step(`${payload.action === "write" ? "writing" : payload.action === "read" ? "reading" : "talking to"} the sheet: ${what}`);
       let response;
       try {
-        response = await post(payload);
+        response = await withDeadline(post(payload), REQUEST_TIMEOUT_MS + 5000, "the sheet never answered");
       } catch (error) {
         last = error.message;
         continue;
@@ -1180,7 +1227,9 @@
   // ------------------------------------------------------------------------------------------
   // A round: the nation you are on, then any others that are due
 
-  let running = false;
+  /** When this tab's round started, or 0. A round older than ROUND_STUCK_MS is treated as dead. */
+  let runningSince = 0;
+  const ROUND_STUCK_MS = 4 * 60 * 1000;
 
   function dueInterval() {
     if (!ON_GAME) return OFFSITE_INTERVAL_MS;
@@ -1192,11 +1241,12 @@
     const settings = allSettings();
     if (!Object.values(settings).some(isConfigured)) return;
     if (!force && Date.now() - (roundState().lastAttempt || 0) < dueInterval()) return;
-    if (running || !takeLock()) return;
-    running = true;
-    saveRound({ lastAttempt: Date.now() });
-    render();
+    if (runningSince && Date.now() - runningSince < ROUND_STUCK_MS) return;
+    if (!takeLock()) return;
+    runningSince = Date.now();
+    saveRound({ lastAttempt: Date.now(), inProgress: true, step: "starting", startedAt: Date.now(), pageFetchFailed: null });
     try {
+      render();
       const stale = rotationRecord();
       if (stale) {
         rotating = { ...stale };
@@ -1226,12 +1276,21 @@
       for (const { name, read, error } of reads) {
         if (isConfigured(settings[name])) await syncNation(name, settings[name], read, error, api, force);
       }
-      saveRound({ error: null, loggedOut: false });
+      // A nation set up under a name the game no longer lists would otherwise just never sync.
+      const listed = new Set(home.overview.nations.map((nation) => nation.name));
+      for (const name of Object.keys(settings)) {
+        if (isConfigured(settings[name]) && !listed.has(name)) {
+          saveState(name, { error: `the game lists no nation called "${name}" on your login (it lists ${[...listed].join(", ")})`, checkedAt: Date.now() });
+        }
+      }
+      saveRound({ error: null, loggedOut: false, inProgress: false });
     } catch (error) {
-      saveRound({ error: error.message || String(error) });
+      const where = roundState().step;
+      saveRound({ error: `${error.message || String(error)}${where ? ` (while ${where})` : ""}`, inProgress: false });
       console.error("[CLOP Sheet Sync]", error);
     } finally {
-      running = false;
+      runningSince = 0;
+      if (roundState().inProgress) saveRound({ inProgress: false });
       releaseLock();
       render();
     }
@@ -1402,11 +1461,22 @@
           "while a 4clop.org tab is open."
         : "Not logged in to 4clop.org.";
       level = "bad";
+    } else if (round.inProgress && !syncing()) {
+      // The lock lapsed with the round still marked running: it went quiet part-way.
+      note = `The last sync stopped while ${round.step || "starting"} and never finished.`;
+      level = "bad";
     } else if (round.error) {
       note = `Sync failed: ${round.error}`;
       level = "bad";
     }
-    return { level, entries, note };
+    // Always shown at the bottom, so "nothing is happening" can be told apart from "it's trying".
+    const busyStep = syncing() && round.inProgress ? round.step : null;
+    const footer = [
+      round.lastAttempt ? `Last tried ${new Date(round.lastAttempt).toLocaleTimeString()}` : "No sync has started yet in this browser",
+      busyStep ? `now ${busyStep}` : null,
+      round.pageFetchFailed ? `page fetch failed (${round.pageFetchFailed}), used the userscript manager instead` : null,
+    ].filter(Boolean).join(" · ");
+    return { level, entries, note, footer };
   }
 
   function el(tag, style, textContent) {
@@ -1431,6 +1501,7 @@
         box.appendChild(list);
       }
     }
+    if (info.footer) box.appendChild(el("div", "margin-top:6px;font-size:11px;opacity:.7", info.footer));
     return box;
   }
 

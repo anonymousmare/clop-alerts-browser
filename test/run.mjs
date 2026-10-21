@@ -201,7 +201,16 @@ const shims = `
       for (const listener of listeners[key] || []) listener(key, old, value, false);
     };
     window.GM_addValueChangeListener = (key, listener) => (listeners[key] = listeners[key] || []).push(listener);
+    const flags = window.__flags || {};
+    if (flags.pageFetchFails) {
+      // As a Firefox sandbox can: the page-context fetch refuses outright.
+      const original = window.fetch;
+      window.fetch = (url, options) => /4clop\\.org/.test(String(url))
+        ? Promise.reject(new TypeError("NetworkError when attempting to fetch resource."))
+        : original(url, options);
+    }
     window.GM_xmlhttpRequest = (details) => {
+      if (flags.managerHangs && !/script\\.google/.test(details.url)) return; // never answers at all
       const call = /script\\.google/.test(details.url)
         ? window.__sheetCall(details.data).then((body) => ({ status: 200, body }))
         : window.__gameCall(details.method, details.url, details.data || "");
@@ -219,10 +228,11 @@ const greasemonkeyShims = `
   document.addEventListener("DOMContentLoaded", () => { ${userscript} });
 `;
 
-async function open(browser, sheet, game = new FakeGame(), { manager = "tampermonkey" } = {}) {
+async function open(browser, sheet, game = new FakeGame(), { manager = "tampermonkey", flags = {} } = {}) {
   const context = await browser.newContext();
   const tab = await context.newPage();
   tab.on("pageerror", (error) => console.error("page error:", error));
+  await tab.addInitScript((value) => { window.__flags = value; }, flags);
   await tab.exposeFunction("__sheetCall", (data) => JSON.stringify(sheet.handle(JSON.parse(data))));
   await tab.exposeFunction("__gameCall", (method, url, data) => ({ status: 200, body: game.handle(method, url, data, { viaManager: true }).body }));
   await tab.addInitScript(manager === "greasemonkey" ? greasemonkeyShims : shims);
@@ -449,6 +459,39 @@ test("from another site with a cookieless manager it says why, and the badge ope
   await tab.reload();
   await tab.waitForSelector("#clop-sheet-sync-badge");
   assert.doesNotMatch(await tab.textContent("#clop-sheet-sync-badge"), /Sync now/);
+  await tab.context().close();
+});
+
+test("if the page's own fetch is refused, it falls back to the userscript manager and says so", async (browser) => {
+  const sheet = freshSheet();
+  sheet.set("Dashboard-Stockpile", "J21", 0);
+  const tab = await open(browser, sheet, new FakeGame(), { flags: { pageFetchFails: true } });
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Vladihoofstock synced at/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J21"), 29816);
+  assert.match(status, /page fetch failed \(could not reach 4clop\.org|page fetch failed \(TypeError: NetworkError/, status);
+  await tab.context().close();
+});
+
+test("a request that never answers fails the sync with where it stopped, instead of hanging", async (browser) => {
+  const tab = await open(browser, freshSheet(), new FakeGame(), { flags: { managerHangs: true } });
+  await tab.goto("https://example.com/");
+  await tab.evaluate(() => GM_setValue("settings", { Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "Vladihoofstock(Z)" } }));
+  await tab.reload();
+  await tab.waitForFunction(() => GM_getValue("round", {}).error, null, { timeout: 60000 });
+  const round = await tab.evaluate(() => GM_getValue("round", {}));
+  assert.match(round.error, /4clop\.org never answered \(overview\.php\) \(while asking 4clop\.org for overview\.php\)/);
+  assert.equal(round.inProgress, false);
+  await tab.context().close();
+});
+
+test("a sync that went quiet part-way is reported, with the step it stopped at", async (browser) => {
+  const tab = await open(browser, freshSheet());
+  await configure(tab, VLAD_ROWS);
+  await tab.goto("https://4clop.org/news.php");
+  await tab.evaluate(() => GM_setValue("round", { ...GM_getValue("round", {}), inProgress: true, step: "reading the sheet: Dashboard-Stockpile!A1:AZ200", lastAttempt: Date.now() }));
+  await tab.waitForFunction(() => /stopped while reading the sheet: Dashboard-Stockpile!A1:AZ200 and never finished/
+    .test(document.getElementById("clop-sheet-sync-badge")?.textContent || ""));
   await tab.context().close();
 });
 
