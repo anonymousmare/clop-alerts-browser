@@ -134,11 +134,12 @@ const overviewFor = (nation) => nation.id === VLAD.id
     .replace('<span class="text-success">20,868</span>', '<span class="text-success">11,111</span>');
 
 class FakeGame {
-  constructor({ nations = [VLAD], loggedOut = false, extraForces = false } = {}) {
+  constructor({ nations = [VLAD], loggedOut = false, extraForces = false, deals = (html) => html } = {}) {
     this.nations = nations;
     this.active = nations[0].id;
     this.loggedOut = loggedOut;
     this.extraForces = extraForces;
+    this.deals = deals;
     this.log = [];
   }
   get activeNation() {
@@ -170,7 +171,7 @@ class FakeGame {
     if (name === "api/public/v1.php") return { contentType: "application/json", body: fixture("api.json") };
     if (this.loggedOut && name === "overview.php") return html(this.page("Login", "<center>Please log in.</center>", { loggedIn: false }));
     if (name === "overview.php") return html(this.page("Overview", overviewFor(this.activeNation)));
-    if (name === "deals.php") return html(this.page("Deals", fixture("deals.content.html")));
+    if (name === "deals.php") return html(this.page("Deals", this.deals(fixture("deals.content.html"))));
     if (name === "groupforces.php") {
       return html(this.page("Group Forces", fixture(this.extraForces ? "groupforces-extra.content.html" : "groupforces.content.html")));
     }
@@ -494,6 +495,46 @@ test("a wrong Dashboard Column Name skips the dashboard but still updates the na
   assert.match(status, /no column in row 1 of Dashboard-Stockpile is named "Vladihoofstock"/);
   assert.deepEqual(sheet.tabs["Dashboard-Stockpile"], dash);
   assert.equal(sheet.get("VladihoofstockZ", "B9"), 138);
+  await tab.context().close();
+});
+
+test("a deal whose direction can't be read is never counted as yours -- the Deals block is left alone", async (browser) => {
+  // The incoming offer from Sunlit Fields (99 Gems) follows your outgoing deals. Reword its money
+  // line, as a game update might: it must not inherit "outgoing" from the deal before it.
+  const sheet = freshSheet();
+  const game = new FakeGame({ deals: (html) => html.replace("offers 9,999 bits for this deal", "proposes 9,999 bits") });
+  const tab = await open(browser, sheet, game);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /could not tell whether the deal with Sunlit Fields on deals\.php is yours or theirs/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J52"), "");     // Deals block untouched
+  assert.equal(sheet.get("Dashboard-Stockpile", "J59"), "");     // ...so the 99 Gems never land anywhere
+  assert.equal(sheet.get("Dashboard-Stockpile", "J86"), 132000); // Market still written
+  assert.equal(sheet.get("Dashboard-Stockpile", "J21"), 29816);  // and the main block
+  await tab.context().close();
+});
+
+test("a real draft deal: offered bits and items count, requested items don't", async (browser) => {
+  // A player's own deal, as deals.php showed it: 1,000 bits and 10 DNA offered, 100 DNA requested.
+  const sheet = freshSheet();
+  const game = new FakeGame({ deals: () => fixture("deals-example.content.html") });
+  const tab = await open(browser, sheet, game);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /synced at/, status);
+  const D = "Dashboard-Stockpile";
+  assert.equal(sheet.get(D, "J52"), 1000); // Bits
+  assert.equal(sheet.get(D, "J80"), 10);   // DNA - Saddle - North: offered, so it left the stockpile
+  assert.equal(sheet.get(D, "J82"), 0);    // DNA - Zebrica - Central: requested, not ours
+  for (const row of [54, 55, 56, 57, 58, 59, 73, 84]) assert.equal(sheet.get(D, `J${row}`), 0, `J${row}`);
+  await tab.context().close();
+});
+
+test("an unknown section inside one of your deals leaves the Deals block alone", async (browser) => {
+  const sheet = freshSheet();
+  const game = new FakeGame({ deals: (html) => html.replace("<h4>Offered Items</h4>", "<h4>Offered Goods</h4>") });
+  const tab = await open(browser, sheet, game);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /section "Offered Goods" the script does not know/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J52"), "");
   await tab.context().close();
 });
 

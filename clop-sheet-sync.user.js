@@ -500,10 +500,24 @@
     return counts;
   }
 
+  /** deals.php is readable but not in a shape we can trust: only the Deals block is skipped. */
+  class DealsUnreadable extends SyncError {}
+
+  /** The table headings deals.php prints inside one of your outgoing deals. */
+  const OUTGOING_SECTIONS = new Set([
+    "Offered Items", "Offered Weapons", "Offered Armor", "Requested Items", "Requested Weapons", "Requested Armor",
+  ]);
+
   /**
    * What your outgoing deals are holding: bits you offered and goods under "Offered Items". The game
    * takes both out of your stockpile when you add them to a deal, so they are yours but not on
-   * overview.php. Incoming deals (other nations' offers) are not counted.
+   * overview.php. Nothing in an incoming deal (another nation's offer) is counted: what it offers is
+   * not yours yet, and what it asks for has not been taken from you.
+   *
+   * Which way a deal goes is read from its money line, which the game words differently for the two
+   * (deals.php: "You offer ..." / "offers ..."). Every deal must be classified before its tables are
+   * read, so a line the game rewords can never leave an incoming deal counted as one of yours: the
+   * page is refused instead (DealsUnreadable), and only the Deals block is left alone.
    */
   function parseDeals(html, expectedNation) {
     if (!html.trimEnd().endsWith("</html>")) throw new SyncError("deals.php was cut off before the page finished");
@@ -516,12 +530,26 @@
 
     const goods = {};
     let bits = 0;
-    let direction = null; // "out" | "in"
+    let direction = null; // null before the first deal, then "unknown" until its money line: "out" | "in"
+    let partner = null;
     let section = null;
+    const unclassified = () => new DealsUnreadable(
+      `could not tell whether the deal with ${partner} on deals.php is yours or theirs, so the Deals block was left alone`);
     const content = doc.querySelector("#content") || doc.body;
     for (const node of content.querySelectorAll("h4, center, table")) {
       if (node.tagName === "H4") {
-        section = text(node);
+        if (node.querySelector('a[href*="viewnation.php?nation_id="]')) {
+          // A new deal starts with the other nation's name. The previous one must have been classified.
+          if (direction === "unknown") throw unclassified();
+          direction = "unknown";
+          partner = text(node);
+          section = null;
+        } else {
+          section = text(node);
+          if (direction === "out" && !OUTGOING_SECTIONS.has(section)) {
+            throw new DealsUnreadable(`deals.php has a section ${JSON.stringify(section)} the script does not know, so the Deals block was left alone`);
+          }
+        }
         continue;
       }
       if (node.tagName === "CENTER") {
@@ -542,6 +570,8 @@
         continue;
       }
       // A table.
+      if (direction === null) throw new DealsUnreadable("deals.php has a table outside any deal, so the Deals block was left alone");
+      if (direction === "unknown") throw unclassified();
       if (direction === "out" && section === "Offered Items") {
         for (const tr of node.querySelectorAll("tr")) {
           const cells = tr.querySelectorAll("td");
@@ -552,6 +582,7 @@
       }
       section = null;
     }
+    if (direction === "unknown") throw unclassified();
     return { bits, goods };
   }
 
@@ -577,7 +608,13 @@
     const overview = parseOverview(overviewHtml);
     const name = overview.navbarName || overview.name;
     if (overview.name !== name) throw new SyncError(`overview.php shows ${overview.name} but the navbar says ${name}`);
-    const deals = parseDeals(await gameRequest("deals.php"), name);
+    let deals;
+    try {
+      deals = parseDeals(await gameRequest("deals.php"), name);
+    } catch (error) {
+      if (!(error instanceof DealsUnreadable)) throw error;
+      deals = { unreadable: error.message };
+    }
     const forces = parseForces(await gameRequest("groupforces.php"), name);
     return { name, overview, deals, forces };
   }
@@ -804,6 +841,10 @@
 
     // Deals and Market blocks: "Bits" plus every good, under their marker.
     const block = (label, start, end, data) => {
+      if (data.unreadable) {
+        problems.push(data.unreadable);
+        return;
+      }
       if (start === null) {
         problems.push(`no ${JSON.stringify(label)} row in column A of ${DASHBOARD_TAB}, so that block was skipped`);
         return;

@@ -65,7 +65,10 @@ skipped, and the status line names the problem.
   `Apotheosis Serum` rows, because those can't be traded): what your **outgoing** deals are holding, from
   `deals.php`. `Bits` is the bits you offered, and each good is the amount under *Offered Items*.
   The game takes these out of your stockpile when you add them to a deal, so this is where they
-  show up. Other nations' incoming offers aren't counted.
+  show up. *Requested Items* (what you'd receive) aren't counted, and nothing in other nations'
+  incoming offers is. Which way a deal goes is read from its money line ("You offer…" versus
+  "offers…"). If any deal on the page can't be classified that way, the Deals block is left alone
+  with a warning, so something you'd receive can never be counted as something you have.
 - **Market block** (under the `Market` row): your own orders, read from the public API
   (`api/public/v1.php`, filtered to your nation id from the *View Nation* link on overview). Goods
   are the amounts on your **sell** orders. `Bits` is what your **buy** orders are holding, which is
