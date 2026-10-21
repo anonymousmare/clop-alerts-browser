@@ -174,6 +174,10 @@ async function open(browser, sheet, gameOptions = {}) {
         : page("Overview", fixture("overview.content.html"), gameOptions));
     }
     if (name === "deals.php") return html(page("Deals", fixture("deals.content.html"), gameOptions));
+    if (name === "groupforces.php") {
+      const body = gameOptions.extraForces ? "groupforces-extra.content.html" : "groupforces.content.html";
+      return html(page("Group Forces", fixture(body), gameOptions));
+    }
     if (name === "userinfo.php") return html(page("User Info", fixture("userinfo.content.html"), gameOptions));
     return html(page("News", "<center>news</center>", gameOptions));
   });
@@ -222,6 +226,8 @@ test("full sync writes buildings, stock, dashboard, deals and market -- and noth
   sheet.set("VladihoofstockZ", "B9", 0);       // Basic Mine have (game: 138)
   sheet.set("VladihoofstockZ", "B58", 5);      // Basic Mine disabled (game: 2)
   sheet.set("VladihoofstockZ", "R12", 1);      // oil HAVE (game: 29816)
+  sheet.set("VladihoofstockZ", "R41", 0);      // Pegasi Have (game: 1)
+  sheet.set("VladihoofstockZ", "R39", 4);      // Cavalry Have (game: 0)
   sheet.set("Dashboard-Stockpile", "J21", "#REF!"); // Oil (game: 29816)
   sheet.set("Dashboard-Stockpile", "J9", 99);  // Oil - tick (game: 16)
   const before = { dash: clone(sheet.tabs["Dashboard-Stockpile"]), nation: clone(sheet.tabs.VladihoofstockZ) };
@@ -240,6 +246,11 @@ test("full sync writes buildings, stock, dashboard, deals and market -- and noth
   // STOCK block and its stamp
   assert.equal(get(N, "R12"), 29816);
   assert.equal(get(N, "W10"), SERVER_TIME);
+  // TROOPS block (R39:R44)
+  assert.equal(get(N, "R39"), 0);   // Cavalry
+  assert.equal(get(N, "R41"), 1);   // Pegasi
+  assert.equal(get(N, "R43"), 0);   // Navy (the game's "Naval")
+  assert.equal(get(N, "S41"), 1);   // Want column left alone
   // Dashboard main block
   assert.equal(get(D, "J3"), SERVER_TIME);
   assert.equal(get(D, "J4"), "2500 (4)");
@@ -255,6 +266,7 @@ test("full sync writes buildings, stock, dashboard, deals and market -- and noth
   assert.equal(get(D, "J57"), 1024); // Oil, two deals
   assert.equal(get(D, "J59"), 0);    // Gems: only requested / offered to us
   assert.equal(get(D, "J80"), 15);   // DNA - Saddle - North
+  assert.equal(get(D, "J72"), "");   // spacer where Forbidden Research / Apotheosis Serum would be
   // Market: sell orders, and bits held by buy orders at State Controlled's 1.2
   assert.equal(get(D, "J86"), 100 * 1000 * 1.2 + 2 * 5000 * 1.2);
   assert.equal(get(D, "J91"), 23848 + 73);
@@ -316,6 +328,17 @@ test("a duplicated label refuses only the block it is in", async (browser) => {
   assert.match(status, /"Oil" appears 2 times in the Market block/, status);
   assert.equal(sheet.get("Dashboard-Stockpile", "J86"), "");     // market untouched
   assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);   // deals still written
+  await tab.context().close();
+});
+
+test("troop counts that do not add up to overview's military upkeep leave the TROOPS block alone", async (browser) => {
+  const sheet = freshSheet();
+  sheet.set("VladihoofstockZ", "R40", 9);
+  const tab = await open(browser, sheet, { extraForces: true });
+  const status = await configure(tab, "Vladihoofstock(Z)", "VladihoofstockZ");
+  assert.match(status, /would use 10 gems, 15 gasoline but overview\.php says your military uses 0 gems, 0 gasoline/, status);
+  assert.equal(sheet.get("VladihoofstockZ", "R40"), 9);          // untouched
+  assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);   // everything else still synced
   await tab.context().close();
 });
 

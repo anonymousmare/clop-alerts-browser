@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      1.0.0
+// @version      1.1.0
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
 // @match        https://4clop.org/*
 // @match        https://www.4clop.org/*
@@ -16,9 +16,11 @@
 /*
  * What this does, every time you load a 4clop.org page while logged in (throttled, see SYNC_*):
  *
- *   1. reads overview.php, deals.php and the public API (api/public/v1.php) with your own session;
+ *   1. reads overview.php, deals.php, groupforces.php and the public API (api/public/v1.php) with
+ *      your own session;
  *   2. writes your nation tab ("Sheet Name"): building have/disabled counts in column B, and the
- *      six STOCK goods in the HAVE column plus the timestamp beside the STOCK header;
+ *      six STOCK goods in the HAVE column plus the timestamp beside the STOCK header, and your
+ *      troop counts (from groupforces.php) in the TROOPS block's Have column;
  *   3. writes your column on the Dashboard-Stockpile tab ("Dashboard Column Name"): status rows,
  *      the "- tick" rows and every good, then the Deals block (bits and goods you have put into
  *      outgoing deals) and the Market block (goods on your sell orders, bits held by your buy orders).
@@ -52,8 +54,8 @@
     "overview.php", "deals.php", "makedeal.php", "marketplace.php", "buyermarketplace.php",
     "myoffers.php", "transfer.php", "actions.php", "favoriteactions.php", "majoractions.php",
   ];
-  /** Minimum gap between syncs on any other page. */
-  const SYNC_MIN_INTERVAL_MS = 2 * 60 * 1000;
+  /** Minimum gap between syncs on any other page -- and how often an open tab syncs while idle. */
+  const SYNC_MIN_INTERVAL_MS = 60 * 1000;
   /** Minimum gap even on an action page, so a burst of clicks is one sync. */
   const SYNC_DEBOUNCE_MS = 10 * 1000;
   /**
@@ -174,13 +176,29 @@
   const TICK_LABELS = GOODS.filter((good) => good.tick).map((good) => good.tick);
   const MAIN_LABELS = [...STATUS_LABELS, ...TICK_LABELS, ...GOODS.map((good) => good.dashboard)];
   /**
-   * The Deals and Market blocks: a marker row, then "Bits" and the goods again. The sheet leaves
-   * the two endgame goods out of these blocks, so their rows are written only when present.
+   * The Deals and Market blocks: a marker row, then "Bits" and the goods again -- minus the two
+   * endgame goods, which the game does not let you deal or sell.
    */
   const DEALS_MARKER = "Deals";
   const MARKET_MARKER = "Market";
-  const BLOCK_OPTIONAL = new Set(["Forbidden Research", "Apotheosis Serum"]);
-  const BLOCK_LABELS = ["Bits", ...GOODS.map((good) => good.dashboard).filter((label) => !BLOCK_OPTIONAL.has(label))];
+  const UNTRADEABLE = new Set(["Forbidden Research", "Apotheosis Serum"]);
+  const BLOCK_GOODS = GOODS.filter((good) => !UNTRADEABLE.has(good.game));
+  const BLOCK_LABELS = ["Bits", ...BLOCK_GOODS.map((good) => good.dashboard)];
+
+  /**
+   * Force types as groupforces.php prints them -> the nation tab's TROOPS labels, and what one unit
+   * costs every 12 hours (backend_overview.php's "Your military also uses ..." line).
+   */
+  const TROOPS = [
+    { game: "Cavalry", sheet: "Cavalry", upkeep: { apples: 5 } },
+    { game: "Tanks", sheet: "Tanks", upkeep: { gasoline: 5 } },
+    { game: "Pegasi", sheet: "Pegasi", upkeep: { coffee: 5 } },
+    { game: "Unicorns", sheet: "Unicorns", upkeep: { gems: 5 } },
+    { game: "Naval", sheet: "Navy", upkeep: { gasoline: 5 } },
+    { game: "Alicorns", sheet: "Alicorns", upkeep: { gems: 10 } },
+  ];
+  const TROOPS_HEADER = "TROOPS";
+  const TROOPS_HAVE = "Have";
 
   const STOCK_HEADER = "STOCK";
   const HAVE_HEADER = "HAVE";
@@ -352,6 +370,14 @@
       if (!match) throw new SyncError(`building ${building} has an unreadable count ${JSON.stringify(count)} on overview.php`);
       buildings[building] = { have: toInt(match[1], building), disabled: match[2] ? toInt(match[2], building) : 0 };
     }
+    // "Your military also uses 0 apples, 0 gems, 5 coffee, and 0 gasoline every 12 hours."
+    const upkeepMatch = /military also uses ([\d,]+) apples, ([\d,]+) gems, ([\d,]+) coffee, and ([\d,]+) gasoline/
+      .exec(text(resourceTable.closest(".panel")));
+    const militaryUpkeep = upkeepMatch
+      ? { apples: toInt(upkeepMatch[1], "military apples"), gems: toInt(upkeepMatch[2], "military gems"),
+          coffee: toInt(upkeepMatch[3], "military coffee"), gasoline: toInt(upkeepMatch[4], "military gasoline") }
+      : null;
+
     if (!Object.keys(resources).length && !Object.keys(buildings).length) {
       throw new SyncError("overview.php lists no resources and no buildings at all (a failed game query?); nothing was written");
     }
@@ -373,7 +399,36 @@
       resources,
       ticks,
       buildings,
+      militaryUpkeep,
     };
+  }
+
+  /**
+   * How many units of each force type you have, wherever they are, from groupforces.php. Each
+   * force's cell reads "<type><br/><weapon><br/><armor><br/>Size: N<br/>Training: N" after its
+   * rename form; the type is the first bare text in the cell.
+   */
+  function parseForces(html, expectedNation) {
+    if (!html.trimEnd().endsWith("</html>")) throw new SyncError("groupforces.php was cut off before the page finished");
+    const doc = parseHtml(html);
+    if (!isLoggedIn(doc)) throw new SyncError("groupforces.php came back logged out");
+    const shown = navbarNation(doc);
+    if (shown && expectedNation && shown !== expectedNation) {
+      throw new SyncError(`groupforces.php is for ${shown}, not ${expectedNation} (switched nation mid-sync?)`);
+    }
+    const counts = Object.fromEntries(TROOPS.map((troop) => [troop.game, 0]));
+    const content = doc.querySelector("#content") || doc.body;
+    for (const td of content.querySelectorAll("td")) {
+      const lines = [...td.childNodes]
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent.trim())
+        .filter(Boolean);
+      const size = lines.map((line) => /^Size:\s*([\d,]+)$/.exec(line)).find(Boolean);
+      if (!size) continue;
+      if (!(lines[0] in counts)) throw new SyncError(`groupforces.php lists a force of unknown type ${JSON.stringify(lines[0])}`);
+      counts[lines[0]] += toInt(size[1], `${lines[0]} force size`);
+    }
+    return counts;
   }
 
   /**
@@ -451,6 +506,7 @@
   async function readGame() {
     const overview = parseOverview(await fetchPage("overview.php"));
     const deals = parseDeals(await fetchPage("deals.php"), overview.navbarName || overview.name);
+    const forces = parseForces(await fetchPage("groupforces.php"), overview.navbarName || overview.name);
     const apiText = await fetchPage("api/public/v1.php");
     let api;
     try {
@@ -465,7 +521,7 @@
       nationId = match.nation_id;
     }
     const market = parseMarket(api, nationId, buyingMultiplier(overview.economy, overview.activeEconomy));
-    return { overview, deals, market, nationId };
+    return { overview, deals, market, forces, nationId };
   }
 
   // ------------------------------------------------------------------------------------------
@@ -581,6 +637,46 @@
     };
   }
 
+  /**
+   * The TROOPS block's Have column (R39:R44 today), on the same Q:W read as the STOCK block. The
+   * counts must add up to overview.php's military upkeep line, or the block is left alone.
+   */
+  function planTroops(grid, tab, game, problems) {
+    const header = grid.findIndex((line) => String((line && line[0]) ?? "").trim() === TROOPS_HEADER);
+    if (header < 0) {
+      problems.push(`no ${JSON.stringify(TROOPS_HEADER)} header in column Q of tab ${JSON.stringify(tab)}`);
+      return [];
+    }
+    const haveOffset = (grid[header] || []).findIndex((cell) => String(cell ?? "").trim() === TROOPS_HAVE);
+    if (haveOffset < 0) {
+      problems.push(`no ${JSON.stringify(TROOPS_HAVE)} column beside the ${TROOPS_HEADER} header on tab ${JSON.stringify(tab)}`);
+      return [];
+    }
+    let end = header + 1;
+    while (end < grid.length && String(cellAt(grid, end, 0) ?? "").trim()) end++;
+    const local = [];
+    const where = `the ${TROOPS_HEADER} block (column Q) of tab ${JSON.stringify(tab)}`;
+    const rows = resolveLabels(indexColumnA(grid, header + 1, end), TROOPS.map((troop) => troop.sheet), where, local);
+
+    const upkeep = game.overview.militaryUpkeep;
+    if (upkeep) {
+      const expected = { apples: 0, gems: 0, coffee: 0, gasoline: 0 };
+      for (const troop of TROOPS) {
+        for (const [good, each] of Object.entries(troop.upkeep)) expected[good] += each * game.forces[troop.game];
+      }
+      const off = Object.keys(expected).filter((good) => expected[good] !== upkeep[good]);
+      if (off.length) {
+        local.push(`the forces on groupforces.php would use ${off.map((g) => `${expected[g]} ${g}`).join(", ")} but overview.php says your military uses ${off.map((g) => `${upkeep[g]} ${g}`).join(", ")}, so the ${TROOPS_HEADER} block was left alone`);
+      }
+    }
+    if (local.length) {
+      problems.push(...local);
+      return [];
+    }
+    const column = STOCK_FIRST_COLUMN + haveOffset;
+    return TROOPS.map((troop) => ({ tab, column, row: rows[troop.sheet], value: game.forces[troop.game] }));
+  }
+
   /** Your column on the Dashboard-Stockpile tab: the main block, then Deals, then Market. */
   function planDashboard(grid, columnName, game, problems) {
     const header = grid[0] || [];
@@ -634,26 +730,18 @@
       }
       const local = [];
       const where = `the ${label} block of ${DASHBOARD_TAB}`;
-      const index = indexColumnA(grid, start + 1, end);
-      const blockRows = resolveLabels(index, BLOCK_LABELS, where, local);
-      for (const optional of BLOCK_OPTIONAL) {
-        const places = index.get(optional) || [];
-        if (places.length === 1) blockRows[optional] = places[0];
-        else if (places.length > 1) local.push(`${JSON.stringify(optional)} appears ${places.length} times in ${where}`);
-      }
-      for (const [name, amount] of Object.entries(data.goods)) {
-        const good = GOOD_BY_GAME.get(name);
-        if (!good) local.push(`your ${label.toLowerCase()} hold ${JSON.stringify(name)}, which the script does not know -- update GOODS`);
-        else if (amount && !(good.dashboard in blockRows)) local.push(`your ${label.toLowerCase()} hold ${amount} ${name}, but ${where} has no ${JSON.stringify(good.dashboard)} row`);
+      const blockRows = resolveLabels(indexColumnA(grid, start + 1, end), BLOCK_LABELS, where, local);
+      for (const name of Object.keys(data.goods)) {
+        if (!GOOD_BY_GAME.has(name) || UNTRADEABLE.has(name)) {
+          local.push(`your ${label.toLowerCase()} hold ${JSON.stringify(name)}, which the ${label} block has no row for`);
+        }
       }
       if (local.length) {
         problems.push(...local);
         return;
       }
       cells.push({ tab: DASHBOARD_TAB, column, row: blockRows.Bits, value: data.bits });
-      for (const good of GOODS) {
-        if (good.dashboard in blockRows) cells.push({ tab: DASHBOARD_TAB, column, row: blockRows[good.dashboard], value: data.goods[good.game] || 0 });
-      }
+      for (const good of BLOCK_GOODS) cells.push({ tab: DASHBOARD_TAB, column, row: blockRows[good.dashboard], value: data.goods[good.game] || 0 });
     };
     block(DEALS_MARKER, dealsAt, marketAt !== null && marketAt > (dealsAt ?? -1) ? marketAt : grid.length, deals);
     block(MARKET_MARKER, marketAt, grid.length, market);
@@ -790,6 +878,7 @@
       const stock = planStock(stockRead.values, sheetName, game.overview, problems);
       cells.push(...stock.cells);
       stamps.push(...stock.stamps);
+      cells.push(...planTroops(stockRead.values, sheetName, game, problems));
     } else {
       problems.push(`could not read tab ${JSON.stringify(sheetName)}: ${(buildingsRead.ok ? stockRead : buildingsRead).error}`);
     }
@@ -874,7 +963,7 @@
       const shown = game.overview.navbarName || game.overview.name;
       if (shown !== nation) throw new SyncError(`overview.php is for ${shown}, not ${nation} (switched nation mid-sync?)`);
       const digest = JSON.stringify([settings, game.overview.status, game.overview.resources, game.overview.ticks,
-        game.overview.buildings, game.deals, game.market]);
+        game.overview.buildings, game.deals, game.market, game.forces]);
       if (!force && state.ok && state.digest === digest && Date.now() - (state.lastWrite || 0) < UNCHANGED_REFRESH_MS) {
         saveState(nation, { checkedAt: Date.now() });
       } else {
@@ -992,6 +1081,10 @@
     if (!nation) return;
     if (location.pathname.endsWith("userinfo.php")) addSettingsForm(nation);
     runSync(nation);
+    // Keep syncing while the tab stays open. Every tab runs this; the shared lock and last-attempt
+    // time keep it to one sync a minute however many tabs there are.
+    // Checking more often than the interval is what lets the throttle fire on the minute.
+    setInterval(() => runSync(nation), SYNC_MIN_INTERVAL_MS / 4);
   }
 
   main();
