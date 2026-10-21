@@ -2,34 +2,37 @@
 
 `clop-sheet-sync.user.js` keeps the shared CLOP planning spreadsheet up to date from your own
 logged-in 4clop.org session. There's no Python, no password to store, and nothing to keep running.
-While you play, it reads your pages and writes your numbers to the sheet.
+While your browser is open, it reads your pages and writes your numbers to the sheet, for every
+nation on your login.
 
-It only **reads** the game. It never clicks, posts, or changes anything in CLOP.
+It only **reads** the game. The one thing it does in CLOP is switch your session to another nation
+and back, so it can read that nation (see [Your other nations](#your-other-nations)).
 
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
 2. Open `clop-sheet-sync.user.js` from this repo's **Raw** view. Tampermonkey offers to install it.
    (You can also go to Tampermonkey → *Create a new script*, paste the file in, and save.)
-3. The first time it talks to the sheet, Tampermonkey asks whether it may connect to
-   `script.google.com`. Choose **Always allow** (and do the same for `script.googleusercontent.com`
-   if it asks).
+3. The first time it connects to 4clop.org and to the sheet, Tampermonkey asks for permission.
+   Choose **Always allow** for `4clop.org`, `script.google.com` and `script.googleusercontent.com`.
 
-## Set up (once per nation)
+Tampermonkey will list the script as running on every site. That's how it keeps syncing when you
+have no 4clop.org tab open. On other sites it shows nothing and never reads the page. All it does
+there is the 2-minute timer and its own requests to 4clop.org and the sheet.
+
+## Set up
 
 Go to **User → User Info** in the game. Above the password form there's a new
-**Spreadsheet Sync** box for the nation you're on right now:
+**Spreadsheet Sync** table. It has one row for every nation in your empire, taken from the game's
+nation dropdown, so you fill them all in at once without switching:
 
 | Field | What to type | Example |
 |---|---|---|
-| **Dashboard Column Name** | Your column's header in row 1 of the `Dashboard-Stockpile` tab, exactly as written | `Vladihoofstock(Z)` |
-| **Sheet Name** | The name of your nation's own tab | `VladihoofstockZ` |
+| **Dashboard Column Name** | That nation's header in row 1 of the `Dashboard-Stockpile` tab, exactly as written | `Vladihoofstock(Z)` |
+| **Sheet Name** | The name of that nation's own tab | `VladihoofstockZ` |
 
-Click **Save Sheet Settings** and it syncs right away. The line under the buttons says how it went.
-
-If you have several nations on one login, switch nation with the game's nation dropdown and fill the
-box in again. Settings are stored per nation, and every sync checks that all the pages it read are
-for the nation it's writing.
+Click **Save Sheet Settings** and it syncs every nation right away. The lines under the buttons say
+how each one went. Leave a row empty to skip that nation.
 
 ## What it writes
 
@@ -75,19 +78,49 @@ and they go last, so a failed write can never leave a fresh stamp sitting over s
 
 ## When it syncs
 
-- **Every minute** while any 4clop.org tab is open, even if you're not clicking. It also syncs on
-  page loads. However many tabs you have open, it still only syncs once a minute.
+- **Every minute** while any 4clop.org tab is open, even if you're not clicking.
+- **Every 2 minutes** when no 4clop.org tab is open but the browser has any other tab open. It
+  uses your 4clop.org login cookie, so you only need to be logged in. A userscript can't run with
+  no tabs open at all; that would take a full browser extension.
 - On pages where you usually change things (Overview, Deals, Marketplace, My Offers, Transfers,
-  Actions, …), every time, apart from a 10-second debounce.
+  Actions, …), on every page load, apart from a 10-second debounce.
+- The nation you're on syncs every round. Your other nations are visited at most every 5 minutes.
 - Every sync reads the game. The sheet is only written when something has actually changed. If
   nothing has changed, it leaves the sheet alone, but still refreshes the timestamps every
   30 minutes.
-- **Click the badge** in the bottom-right corner to sync immediately.
+- However many tabs you have open, only one sync runs at a time.
 
-![The badge in each state](docs/badge-states.png)
+**Going easy on the server.** The game's host asks for no more than one request a second, so the
+script waits at least a second between its requests to 4clop.org. That limit is shared by every
+tab and counts your own page loads too. A sync of one nation is 4 requests (overview, deals, group
+forces, the API). Each other nation adds 3 more, plus one to switch back.
 
-The badge is green when the sync was clean, amber when it ran with problems (it lists them), red
-when it failed, and grey when the sync isn't set up yet. Only one tab syncs at a time.
+## The badge
+
+![The badge collapsed, opened, and while syncing](docs/badge-v2.png)
+
+On 4clop.org pages there's a badge in the bottom-right corner. Collapsed, it's a small pill whose
+colour shows how the last sync went. Click it to open the panel: one line per nation, any problems
+listed underneath, and a big **⟳ Sync now** button. **–** collapses it again, and it stays the way
+you left it.
+
+Green means a clean sync and amber means it synced, but some part of the sheet had a problem.
+Red means the sync failed or you're logged out, and grey means it isn't set up yet.
+
+## Your other nations
+
+The game only lets a session look at one nation at a time. To read your other nations, the script
+switches your session to each one, reads its overview, deals and group forces, and then switches
+back. It's the same thing the game's nation dropdown does. All the reading happens first and the
+sheet is written afterwards, so you're away from your own nation for a few seconds at most.
+
+So nothing you do lands on the wrong nation during those seconds:
+
+- every 4clop.org tab shows a "reading your other nations" overlay;
+- a form you submit is **held**, then sent with the button you clicked once your nation is back;
+- a page that loaded during the switch reloads, so you never act on another nation's page;
+- if the tab doing the switch is closed half-way, the next sync from any tab switches you back
+  before doing anything else.
 
 ## Safety checks
 
@@ -95,8 +128,8 @@ It refuses to write anything when:
 
 - `overview.php` comes back logged out, cut off, or without its Nation / Resources / Buildings
   panels;
-- a page is for a different nation than the one you're on (for example, you switched nations
-  mid-sync);
+- a page is for a different nation than the one being synced (for example, you switched nations
+  mid-sync, or a switch landed somewhere unexpected);
 - a number on the page can't be read.
 
 ## The sheet endpoint
@@ -121,8 +154,16 @@ per range instead.
 node test/run.mjs
 ```
 
-This runs the script in headless Chromium (via Playwright) against the game's real page markup
-(`test/fixtures/`) and a fake sheet loaded from TSV exports of the real tabs. It checks every block
-above, makes sure nothing outside your own cells changes, and covers the no-`batch` fallback, a
-wrong column name, a duplicated label, troop counts that don't match the upkeep line, and a
-logged-out page.
+This runs the script in headless Chromium (via Playwright) against a fake game built from the real
+page markup (`test/fixtures/`) and a fake sheet loaded from TSV exports of the real tabs. The fake
+game remembers which nation the session is on, like the real one. The tests cover:
+
+- every block above, and that nothing outside your own cells changes;
+- syncing two nations by switching and switching back;
+- holding a form submitted mid-switch, and recovering from a switch that was abandoned;
+- the one-second spacing, and syncing from a tab on another site;
+- the badge;
+- the no-`batch` fallback, a wrong column name, a duplicated label, troop counts that don't match
+  the upkeep line, and a logged-out session.
+
+Because of the one-second spacing, a run takes a couple of minutes.

@@ -1,20 +1,24 @@
 // ==UserScript==
 // @name         CLOP Sheet Sync
 // @namespace    https://github.com/anonymousmare/clop-alerts-browser
-// @version      1.1.0
+// @version      2.0.0
 // @description  Keeps the shared CLOP planning sheet up to date from your logged-in 4clop.org session: buildings, stockpiles, deals and market.
-// @match        https://4clop.org/*
-// @match        https://www.4clop.org/*
+// @match        *://*/*
+// @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
+// @connect      4clop.org
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @run-at       document-idle
 // ==/UserScript==
 
 /*
- * What this does, every time you load a 4clop.org page while logged in (throttled, see SYNC_*):
+ * What this does, every minute while a 4clop.org tab is open, and every two minutes from any other
+ * tab when none is (see SYNC_* -- the script runs on every site so it can, but does nothing there
+ * except this timer):
  *
  *   1. reads overview.php, deals.php, groupforces.php and the public API (api/public/v1.php) with
  *      your own session;
@@ -25,8 +29,10 @@
  *      the "- tick" rows and every good, then the Deals block (bits and goods you have put into
  *      outgoing deals) and the Market block (goods on your sell orders, bits held by your buy orders).
  *
- * Both names are set per nation on User Info (userinfo.php). Nothing is ever done in the game: the
- * script only reads pages. Every sheet cell is found by looking its label up, never by row number,
+ * Both names are set per nation on User Info (userinfo.php). Every nation on your login that has
+ * them is synced: the script switches the session to each in turn, reads it, and switches back
+ * (see visitOthers -- 4clop tabs hold any form you submit until it is back). Apart from that
+ * switch, nothing is ever done in the game: the script only reads pages. Every sheet cell is found by looking its label up, never by row number,
  * and a region whose labels do not line up is skipped and reported instead of guessed at.
  */
 
@@ -54,8 +60,12 @@
     "overview.php", "deals.php", "makedeal.php", "marketplace.php", "buyermarketplace.php",
     "myoffers.php", "transfer.php", "actions.php", "favoriteactions.php", "majoractions.php",
   ];
-  /** Minimum gap between syncs on any other page -- and how often an open tab syncs while idle. */
+  /** How often a 4clop.org tab syncs (also the minimum gap between page-load syncs there). */
   const SYNC_MIN_INTERVAL_MS = 60 * 1000;
+  /** How often any other tab syncs, for when no 4clop.org tab is open. */
+  const OFFSITE_INTERVAL_MS = 2 * 60 * 1000;
+  /** Your other nations are visited at most this often; the one you are on syncs every round. */
+  const OTHER_NATIONS_INTERVAL_MS = 5 * 60 * 1000;
   /** Minimum gap even on an action page, so a burst of clicks is one sync. */
   const SYNC_DEBOUNCE_MS = 10 * 1000;
   /**
@@ -63,8 +73,12 @@
    * much time has passed -- then it is re-checked and the timestamps refreshed anyway.
    */
   const UNCHANGED_REFRESH_MS = 30 * 60 * 1000;
-  /** A crashed sync in another tab cannot hold the lock longer than this. */
-  const LOCK_MS = 3 * 60 * 1000;
+  /** A sync refreshes its lock as it goes; one that stops (a closed tab) frees it this soon. */
+  const LOCK_MS = 30 * 1000;
+  /** A nation visit that has not checked in for this long is a crashed one, and is undone. */
+  const ROTATION_STALE_MS = 15 * 1000;
+  /** At most one request a second to 4clop.org, as the game's host asks. */
+  const GAME_REQUEST_GAP_MS = 1000;
 
   /** Waits between attempts at the sheet endpoint (seconds). Google's endpoint fails transiently. */
   const RETRY_DELAYS = [0, 0.5, 1, 2, 4, 8, 15];
@@ -248,10 +262,42 @@
     return new DOMParser().parseFromString(html, "text/html");
   }
 
-  async function fetchPage(path) {
-    const response = await fetch(new URL(path, location.origin), { credentials: "same-origin", cache: "no-store" });
-    if (!response.ok) throw new SyncError(`${path} answered HTTP ${response.status}`);
-    return response.text();
+  const ON_GAME = /(^|\.)4clop\.org$/.test(location.hostname);
+  /** The game's own host when we are on it (its cookie may be www.-scoped), the live game otherwise. */
+  const GAME_ORIGIN = ON_GAME ? location.origin : "https://4clop.org";
+
+  /**
+   * The game's host asks for no more than one request a second. Every request the script makes to
+   * 4clop.org waits until a second has passed since the last one -- from any tab, and since your own
+   * last 4clop.org page load, which is recorded in main().
+   */
+  async function paceGame() {
+    for (;;) {
+      const wait = GM_getValue("lastGameRequest", 0) + GAME_REQUEST_GAP_MS - Date.now();
+      if (wait <= 0) break;
+      await sleep(wait);
+    }
+    GM_setValue("lastGameRequest", Date.now());
+  }
+
+  /** GET `path` from the game, or POST `form` to it, with your 4clop.org session cookie. */
+  async function gameRequest(path, form) {
+    await paceGame();
+    heartbeat();
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: form ? "POST" : "GET",
+        url: `${GAME_ORIGIN}/${path}`,
+        data: form ? new URLSearchParams(form).toString() : undefined,
+        headers: form ? { "Content-Type": "application/x-www-form-urlencoded" } : {},
+        timeout: REQUEST_TIMEOUT_MS,
+        onload: (response) => (response.status >= 200 && response.status < 300
+          ? resolve(response.responseText)
+          : reject(new SyncError(`${path} answered HTTP ${response.status}`))),
+        onerror: () => reject(new SyncError(`could not reach 4clop.org (${path})`)),
+        ontimeout: () => reject(new SyncError(`4clop.org timed out (${path})`)),
+      });
+    });
   }
 
   // ------------------------------------------------------------------------------------------
@@ -263,13 +309,29 @@
 
   /** The active nation as the navbar shows it: plain text, or the selected nation-switcher option. */
   function navbarNation(doc) {
+    const active = navbarNations(doc).active;
+    return active ? active.name : null;
+  }
+
+  /**
+   * Every nation on the login, from the navbar: a nation-switcher <select> when there are several
+   * ({id, name} each, the selected one active), or plain text when there is one (its id is then
+   * not on the page, and not needed -- there is nothing to switch to).
+   */
+  function navbarNations(doc) {
     const select = doc.querySelector('select[name="switchnation_id"]');
     if (select) {
-      const option = select.querySelector("option[selected]") || select.querySelector("option");
-      return option ? text(option) : null;
+      const all = [...select.querySelectorAll("option")].map((option) => ({
+        id: parseInt(option.getAttribute("value"), 10),
+        name: text(option),
+      }));
+      const selected = select.querySelector("option[selected]");
+      const active = selected ? all.find((nation) => nation.id === parseInt(selected.getAttribute("value"), 10)) : null;
+      return { active: active || null, all };
     }
     const first = doc.querySelector("ul.navbar-right > li > a");
-    return first ? text(first) || null : null;
+    const name = first ? text(first) : "";
+    return name ? { active: { id: null, name }, all: [{ id: null, name }] } : { active: null, all: [] };
   }
 
   function serverTime(doc) {
@@ -385,6 +447,7 @@
     return {
       name,
       navbarName: navbarNation(doc),
+      nations: navbarNations(doc).all,
       nationId: idMatch ? parseInt(idMatch[1], 10) : null,
       serverTime: serverTime(doc),
       economy: row("Economic Type"),
@@ -503,17 +566,28 @@
     return { bits, goods };
   }
 
-  async function readGame() {
-    const overview = parseOverview(await fetchPage("overview.php"));
-    const deals = parseDeals(await fetchPage("deals.php"), overview.navbarName || overview.name);
-    const forces = parseForces(await fetchPage("groupforces.php"), overview.navbarName || overview.name);
-    const apiText = await fetchPage("api/public/v1.php");
-    let api;
+  /** Everything one nation's sync needs from its own session pages, given its overview.php. */
+  async function readNation(overviewHtml) {
+    const overview = parseOverview(overviewHtml);
+    const name = overview.navbarName || overview.name;
+    if (overview.name !== name) throw new SyncError(`overview.php shows ${overview.name} but the navbar says ${name}`);
+    const deals = parseDeals(await gameRequest("deals.php"), name);
+    const forces = parseForces(await gameRequest("groupforces.php"), name);
+    return { name, overview, deals, forces };
+  }
+
+  async function readApi() {
     try {
-      api = JSON.parse(apiText);
+      return JSON.parse(await gameRequest("api/public/v1.php"));
     } catch (error) {
+      if (error instanceof SyncError) throw error;
       throw new SyncError("api/public/v1.php did not answer JSON");
     }
+  }
+
+  /** Add the market, which needs the nation id and the API. */
+  function withMarket(read, api) {
+    const { overview } = read;
     let nationId = overview.nationId;
     if (nationId === null) {
       const match = (api.nations || []).find((nation) => nation.name === overview.name);
@@ -521,7 +595,7 @@
       nationId = match.nation_id;
     }
     const market = parseMarket(api, nationId, buyingMultiplier(overview.economy, overview.activeEconomy));
-    return { overview, deals, market, forces, nationId };
+    return { ...read, market, nationId };
   }
 
   // ------------------------------------------------------------------------------------------
@@ -802,6 +876,7 @@
     for (const delay of RETRY_DELAYS) {
       if (Date.now() - started > SHEET_DEADLINE_MS) break;
       await sleep(delay * 1000);
+      heartbeat();
       let response;
       try {
         response = await post(payload);
@@ -909,10 +984,10 @@
   }
 
   // ------------------------------------------------------------------------------------------
-  // Settings and state (per nation, in Tampermonkey storage)
+  // Settings and state (Tampermonkey storage, shared by every tab)
 
+  const isConfigured = (settings) => !!(settings && settings.dashboardColumn && settings.sheetName);
   const allSettings = () => GM_getValue("settings", {});
-  const settingsFor = (nation) => allSettings()[nation] || { dashboardColumn: "", sheetName: "" };
   function saveSettings(nation, value) {
     const all = allSettings();
     all[nation] = value;
@@ -924,167 +999,442 @@
     all[nation] = { ...(all[nation] || {}), ...value };
     GM_setValue("state", all);
   }
-
-  function takeLock() {
-    const lock = GM_getValue("lock", 0);
-    if (lock > Date.now()) return false;
-    GM_setValue("lock", Date.now() + LOCK_MS);
-    return true;
+  /** Round-wide status: when the last round started, and a failure that stopped the whole round. */
+  const roundState = () => GM_getValue("round", {});
+  const saveRound = (value) => GM_setValue("round", { ...roundState(), ...value });
+  /** Every nation seen on the login, so User Info can list them all. */
+  const knownNations = () => GM_getValue("nations", []);
+  function rememberNations(nations) {
+    if (nations.length && JSON.stringify(nations) !== JSON.stringify(knownNations())) GM_setValue("nations", nations);
   }
-  const releaseLock = () => GM_setValue("lock", 0);
 
   // ------------------------------------------------------------------------------------------
-  // Driving it, and showing what happened
+  // One round at a time, across every tab
+
+  let holdingLock = false;
+  /** While set, the session may be on another nation: {home: {id, name}, started, beat}. */
+  let rotating = null;
+
+  function takeLock() {
+    if (GM_getValue("lock", 0) > Date.now()) return false;
+    GM_setValue("lock", Date.now() + LOCK_MS);
+    holdingLock = true;
+    return true;
+  }
+  function releaseLock() {
+    holdingLock = false;
+    GM_setValue("lock", 0);
+  }
+  const syncing = () => GM_getValue("lock", 0) > Date.now();
+  const rotationRecord = () => GM_getValue("rotation", null);
+
+  /** Called before every request: keeps the lock, and any nation visit, from looking abandoned. */
+  function heartbeat() {
+    if (!holdingLock) return;
+    GM_setValue("lock", Date.now() + LOCK_MS);
+    if (rotating) {
+      rotating.beat = Date.now();
+      GM_setValue("rotation", rotating);
+    }
+  }
+
+  // ------------------------------------------------------------------------------------------
+  // Visiting your other nations
+
+  /** Switch the session back to `home` and confirm it took. Ends the visit. */
+  async function switchBack(home) {
+    const html = await gameRequest("overview.php", { switchnation_id: home.id });
+    const active = navbarNations(parseHtml(html)).active;
+    if (!active || active.id !== home.id) throw new SyncError(`could not switch the game back to ${home.name}`);
+    GM_setValue("lastRotation", { started: rotating ? rotating.started : Date.now(), ended: Date.now() });
+    rotating = null;
+    GM_setValue("rotation", null);
+  }
+
+  /**
+   * Read each of `others` by switching the session to it, then switch back to `home`.
+   *
+   * The game keeps one active nation per session, so this is the only way to see another nation's
+   * overview, deals and forces without your password. Everything is read first and the sheet is
+   * written afterwards, so the session is away from `home` for a few page loads only. While it is,
+   * the "rotation" record is set and every 4clop.org tab holds submitted forms and reloads pages
+   * loaded in the meantime (installGuard). If switching back fails, the record stays, and the next
+   * round -- from any tab -- switches back before anything else.
+   */
+  async function visitOthers(home, others) {
+    rotating = { home, started: Date.now(), beat: Date.now() };
+    GM_setValue("rotation", rotating);
+    const results = [];
+    try {
+      for (const nation of others) {
+        try {
+          const read = await readNation(await gameRequest("overview.php", { switchnation_id: nation.id }));
+          if (read.name !== nation.name) throw new SyncError(`switching to ${nation.name} landed on ${read.name}`);
+          results.push({ name: nation.name, read });
+        } catch (error) {
+          results.push({ name: nation.name, error });
+        }
+      }
+    } finally {
+      await switchBack(home);
+    }
+    return results;
+  }
+
+  // ------------------------------------------------------------------------------------------
+  // A round: the nation you are on, then any others that are due
 
   let running = false;
 
-  async function runSync(nation, { force = false } = {}) {
-    const settings = settingsFor(nation);
-    if (!settings.dashboardColumn || !settings.sheetName) {
-      render(nation);
-      return;
-    }
-    const state = stateFor(nation);
-    const since = Date.now() - (state.lastAttempt || 0);
+  function dueInterval() {
+    if (!ON_GAME) return OFFSITE_INTERVAL_MS;
     const page = location.pathname.split("/").pop() || "index.php";
-    if (!force && since < (ACTION_PAGES.includes(page) ? SYNC_DEBOUNCE_MS : SYNC_MIN_INTERVAL_MS)) {
-      render(nation);
-      return;
-    }
-    if (running || !takeLock()) {
-      render(nation);
-      return;
-    }
+    return ACTION_PAGES.includes(page) ? SYNC_DEBOUNCE_MS : SYNC_MIN_INTERVAL_MS;
+  }
+
+  async function runRound({ force = false } = {}) {
+    const settings = allSettings();
+    if (!Object.values(settings).some(isConfigured)) return;
+    if (!force && Date.now() - (roundState().lastAttempt || 0) < dueInterval()) return;
+    if (running || !takeLock()) return;
     running = true;
-    saveState(nation, { lastAttempt: Date.now() });
-    render(nation, "Syncing...");
+    saveRound({ lastAttempt: Date.now() });
+    render();
     try {
-      const game = await readGame();
-      const shown = game.overview.navbarName || game.overview.name;
-      if (shown !== nation) throw new SyncError(`overview.php is for ${shown}, not ${nation} (switched nation mid-sync?)`);
-      const digest = JSON.stringify([settings, game.overview.status, game.overview.resources, game.overview.ticks,
-        game.overview.buildings, game.deals, game.market, game.forces]);
-      if (!force && state.ok && state.digest === digest && Date.now() - (state.lastWrite || 0) < UNCHANGED_REFRESH_MS) {
-        saveState(nation, { checkedAt: Date.now() });
-      } else {
-        const result = await sync(settings, game);
-        const ok = result.problems.length === 0;
-        saveState(nation, {
-          ok,
-          digest: ok ? digest : null,
-          lastWrite: Date.now(),
-          checkedAt: Date.now(),
-          serverTime: game.overview.serverTime,
-          written: result.written,
-          problems: result.problems,
-          error: null,
-        });
+      const stale = rotationRecord();
+      if (stale) {
+        rotating = { ...stale };
+        await switchBack(stale.home);
       }
+
+      const homeHtml = await gameRequest("overview.php");
+      if (!isLoggedIn(parseHtml(homeHtml))) {
+        saveRound({ error: null, loggedOut: true });
+        return;
+      }
+      const home = await readNation(homeHtml);
+      rememberNations(home.overview.nations);
+      const homeRef = home.overview.nations.find((nation) => nation.name === home.name) || { id: null, name: home.name };
+
+      const reads = [{ name: home.name, read: home }];
+      const others = home.overview.nations.filter((nation) =>
+        nation.name !== home.name && nation.id !== null && isConfigured(settings[nation.name]) &&
+        (force || Date.now() - (stateFor(nation.name).lastRead || 0) >= OTHER_NATIONS_INTERVAL_MS));
+      if (others.length && homeRef.id !== null) reads.push(...(await visitOthers(homeRef, others)));
+
+      const api = await readApi();
+      for (const { name, read, error } of reads) {
+        if (isConfigured(settings[name])) await syncNation(name, settings[name], read, error, api, force);
+      }
+      saveRound({ error: null, loggedOut: false });
     } catch (error) {
-      saveState(nation, { ok: false, digest: null, error: error.message || String(error), problems: [], checkedAt: Date.now() });
+      saveRound({ error: error.message || String(error) });
       console.error("[CLOP Sheet Sync]", error);
     } finally {
       running = false;
       releaseLock();
-      render(nation);
+      render();
     }
   }
 
-  function describe(nation) {
-    const settings = settingsFor(nation);
-    if (!settings.dashboardColumn || !settings.sheetName) return { level: "idle", line: "Sheet sync is not set up -- see User Info" };
-    const state = stateFor(nation);
-    if (state.error) return { level: "bad", line: `Sheet sync failed: ${state.error}` };
-    if (!state.checkedAt) return { level: "idle", line: "Sheet sync has not run yet" };
+  async function syncNation(name, settings, read, readError, api, force) {
+    const state = stateFor(name);
+    try {
+      if (readError) throw readError;
+      const game = withMarket(read, api);
+      const digest = JSON.stringify([settings, game.overview.status, game.overview.resources, game.overview.ticks,
+        game.overview.buildings, game.deals, game.market, game.forces]);
+      if (!force && state.ok && state.digest === digest && Date.now() - (state.lastWrite || 0) < UNCHANGED_REFRESH_MS) {
+        saveState(name, { checkedAt: Date.now(), lastRead: Date.now() });
+        return;
+      }
+      const result = await sync(settings, game);
+      const ok = result.problems.length === 0;
+      saveState(name, {
+        ok,
+        digest: ok ? digest : null,
+        lastWrite: Date.now(),
+        lastRead: Date.now(),
+        checkedAt: Date.now(),
+        written: result.written,
+        problems: result.problems,
+        error: null,
+      });
+    } catch (error) {
+      saveState(name, { ok: false, digest: null, error: error.message || String(error), problems: [], checkedAt: Date.now(), lastRead: Date.now() });
+      console.error(`[CLOP Sheet Sync] ${name}:`, error);
+    }
+  }
+
+  // ------------------------------------------------------------------------------------------
+  // On 4clop.org: hold forms while another nation is being read
+
+  /**
+   * While the session is visiting another nation, a form submitted in any 4clop.org tab would act
+   * on the wrong nation. So: submits are held and re-sent (with the button you clicked) once the
+   * session is back, and a page loaded during a visit -- which shows the other nation -- reloads.
+   * Returns true when it is reloading this page.
+   */
+  function installGuard() {
+    const last = GM_getValue("lastRotation", null);
+    const loadedAt = performance.timeOrigin;
+    if (!rotationRecord() && last && loadedAt >= last.started - 5000 && loadedAt <= last.ended) {
+      location.replace(location.href);
+      return true;
+    }
+    let reloadWhenClear = !!rotationRecord();
+    let held = null;
+
+    document.addEventListener("submit", (event) => {
+      if (!rotationRecord()) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      held = { form: event.target, submitter: event.submitter || null };
+      showWait();
+    }, true);
+
+    setInterval(() => {
+      const record = rotationRecord();
+      if (record) {
+        showWait();
+        // Nobody is finishing the visit (its tab closed): switch back from here.
+        if (Date.now() - record.beat > ROTATION_STALE_MS) runRound({ force: true });
+        return;
+      }
+      hideWait();
+      if (reloadWhenClear) {
+        reloadWhenClear = false;
+        location.replace(location.href);
+      } else if (held) {
+        const { form, submitter } = held;
+        held = null;
+        if (submitter && submitter.form === form) form.requestSubmit(submitter);
+        else form.requestSubmit();
+      }
+    }, 250);
+    if (reloadWhenClear) showWait();
+    return false;
+  }
+
+  function showWait() {
+    if (document.getElementById("clop-sheet-sync-wait")) return;
+    const record = rotationRecord();
+    const wait = document.createElement("div");
+    wait.id = "clop-sheet-sync-wait";
+    wait.style.cssText =
+      "position:fixed;inset:0;z-index:10000;background:rgba(20,22,25,.72);display:flex;align-items:center;" +
+      "justify-content:center;color:#fff;font:15px/1.5 sans-serif;text-align:center;padding:24px";
+    wait.textContent =
+      `Sheet Sync is reading your other nations for a few seconds. Anything you submit now is sent once ` +
+      `${record ? record.home.name : "your nation"} is active again.`;
+    document.body.appendChild(wait);
+  }
+  const hideWait = () => document.getElementById("clop-sheet-sync-wait")?.remove();
+
+  // ------------------------------------------------------------------------------------------
+  // The badge
+
+  const COLORS = { ok: "#3c8c40", warn: "#c08a1e", bad: "#b8322a", idle: "#5a6068", busy: "#2a6bb8" };
+  const RANK = { idle: 0, ok: 1, warn: 2, bad: 3 };
+
+  function describeNation(name) {
+    const state = stateFor(name);
+    if (state.error) return { level: "bad", line: `failed: ${state.error}` };
+    if (!state.checkedAt) return { level: "idle", line: "not synced yet" };
     const when = new Date(state.checkedAt).toLocaleTimeString();
     if (state.problems && state.problems.length) {
-      return { level: "warn", line: `Sheet synced at ${when} with ${state.problems.length} problem(s)`, details: state.problems };
+      return { level: "warn", line: `synced at ${when} with ${state.problems.length} problem(s)`, details: state.problems };
     }
-    return { level: "ok", line: `Sheet synced at ${when} (${state.written || 0} cell(s) changed last write)` };
+    return { level: "ok", line: `synced at ${when} (${state.written || 0} cell(s) changed last write)` };
   }
 
-  const COLORS = { ok: "#3c8c40", warn: "#c08a1e", bad: "#b8322a", idle: "#555", busy: "#2a6bb8" };
+  /** What the badge and the User Info status show: one entry per configured nation, plus the round. */
+  function summary() {
+    const settings = allSettings();
+    const names = Object.keys(settings).filter((name) => isConfigured(settings[name]));
+    const round = roundState();
+    const entries = names.map((name) => ({ name, ...describeNation(name) }));
+    let level = entries.reduce((worst, entry) => (RANK[entry.level] > RANK[worst] ? entry.level : worst), entries.length ? "ok" : "idle");
+    let note = null;
+    if (!names.length) note = "Not set up -- fill in your sheet names on User Info.";
+    else if (round.loggedOut) {
+      note = "Not logged in to 4clop.org.";
+      level = "bad";
+    } else if (round.error) {
+      note = `Sync failed: ${round.error}`;
+      level = "bad";
+    }
+    return { level, entries, note };
+  }
 
-  function render(nation, busy) {
-    const info = busy ? { level: "busy", line: busy } : describe(nation);
-    let badge = document.getElementById("clop-sheet-sync-badge");
-    if (!badge) {
-      badge = document.createElement("div");
-      badge.id = "clop-sheet-sync-badge";
-      badge.style.cssText =
-        "position:fixed;right:12px;bottom:12px;z-index:9999;max-width:420px;padding:6px 10px;" +
-        "border-radius:4px;color:#fff;font:12px/1.4 sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.4)";
-      badge.title = "Click to sync now";
-      badge.addEventListener("click", () => runSync(nation, { force: true }));
-      document.body.appendChild(badge);
-    }
-    badge.style.background = COLORS[info.level];
-    badge.textContent = info.line;
-    if (info.details) {
-      const list = document.createElement("ul");
-      list.style.cssText = "margin:4px 0 0 16px;padding:0";
-      for (const problem of info.details) {
-        const item = document.createElement("li");
-        item.textContent = problem;
-        list.appendChild(item);
+  function el(tag, style, textContent) {
+    const node = document.createElement(tag);
+    if (style) node.style.cssText = style;
+    if (textContent !== undefined) node.textContent = textContent;
+    return node;
+  }
+
+  function summaryList(info) {
+    const box = el("div");
+    if (info.note) box.appendChild(el("div", `color:${info.level === "bad" ? "#ff8b80" : "inherit"};margin-bottom:4px`, info.note));
+    for (const entry of info.entries) {
+      const line = el("div", "margin:3px 0");
+      line.appendChild(el("span", `display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:${COLORS[entry.level]}`));
+      line.appendChild(el("b", "", entry.name));
+      line.appendChild(document.createTextNode(` ${entry.line}`));
+      box.appendChild(line);
+      if (entry.details) {
+        const list = el("ul", "margin:2px 0 6px 18px;padding:0");
+        for (const problem of entry.details) list.appendChild(el("li", "", problem));
+        box.appendChild(list);
       }
-      badge.appendChild(list);
     }
+    return box;
+  }
+
+  let lastRendered = "";
+
+  function render() {
+    if (!ON_GAME || !document.body) return;
+    const info = summary();
+    const busy = syncing();
+    const expanded = GM_getValue("ui.expanded", false);
+    const signature = JSON.stringify([info, busy, expanded]);
+    if (signature === lastRendered && document.getElementById("clop-sheet-sync-badge")) return;
+    lastRendered = signature;
+
     const status = document.getElementById("clop-sheet-sync-status");
     if (status) {
-      status.textContent = info.line;
-      status.style.color = COLORS[info.level];
-      if (info.details) status.appendChild(badge.querySelector("ul").cloneNode(true));
+      status.replaceChildren(summaryList(info));
+      if (busy) status.prepend(el("div", `color:${COLORS.busy}`, "Syncing..."));
     }
+
+    document.getElementById("clop-sheet-sync-badge")?.remove();
+    const badge = el("div", "position:fixed;right:12px;bottom:12px;z-index:9999;font:12px/1.4 sans-serif;color:#fff");
+    badge.id = "clop-sheet-sync-badge";
+    const problems = info.entries.reduce((n, entry) => n + (entry.details ? entry.details.length : 0), 0);
+
+    if (!expanded) {
+      const icon = busy ? "⟳" : { ok: "✓", warn: "⚠", bad: "✕", idle: "•" }[info.level];
+      const pill = el("button",
+        "border:0;border-radius:14px;padding:5px 12px;color:#fff;cursor:pointer;font:inherit;font-weight:bold;" +
+        `box-shadow:0 1px 4px rgba(0,0,0,.5);background:${busy ? COLORS.busy : COLORS[info.level]}`,
+        `${icon} Sheet${problems ? ` (${problems})` : ""}`);
+      pill.title = "Sheet Sync -- click to open";
+      pill.addEventListener("click", () => {
+        GM_setValue("ui.expanded", true);
+        render();
+      });
+      badge.appendChild(pill);
+      document.body.appendChild(badge);
+      return;
+    }
+
+    const card = el("div",
+      "width:340px;max-width:calc(100vw - 24px);background:#2b3035;border:1px solid #1c1e22;border-radius:6px;" +
+      `box-shadow:0 2px 10px rgba(0,0,0,.6);border-top:4px solid ${busy ? COLORS.busy : COLORS[info.level]}`);
+    const head = el("div", "display:flex;align-items:center;justify-content:space-between;padding:7px 10px;font-weight:bold;font-size:13px");
+    head.appendChild(el("span", "", "Sheet Sync"));
+    const collapse = el("button", "border:0;background:none;color:#ccc;cursor:pointer;font:bold 16px/1 sans-serif;padding:0 2px", "–");
+    collapse.title = "Collapse";
+    collapse.addEventListener("click", () => {
+      GM_setValue("ui.expanded", false);
+      render();
+    });
+    head.appendChild(collapse);
+    card.appendChild(head);
+
+    const body = el("div", "padding:0 10px 8px;max-height:45vh;overflow:auto");
+    body.appendChild(summaryList(info));
+    card.appendChild(body);
+
+    const button = el("button",
+      "display:block;width:calc(100% - 20px);margin:0 10px 10px;padding:8px;border:0;border-radius:4px;" +
+      `font:bold 14px sans-serif;color:#fff;cursor:${busy ? "default" : "pointer"};background:${busy ? COLORS.busy : COLORS.ok}`,
+      busy ? "⟳ Syncing..." : "⟳ Sync now");
+    button.disabled = busy || !info.entries.length;
+    button.addEventListener("click", () => runRound({ force: true }));
+    card.appendChild(button);
+    badge.appendChild(card);
+    document.body.appendChild(badge);
   }
 
-  /** The two settings fields, on User Info, for whichever nation is active. */
-  function addSettingsForm(nation) {
+  // ------------------------------------------------------------------------------------------
+  // User Info: the two names, for every nation on the login
+
+  function addSettingsForm() {
     const anchor = document.querySelector('form[name="newpassword"]');
     if (!anchor || document.getElementById("clop-sheet-sync-form")) return;
-    const settings = settingsFor(nation);
+    // The navbar's nation switcher lists the whole empire, so every nation gets its own row here
+    // and nobody has to switch nations just to fill them in.
+    const seen = navbarNations(document).all;
+    const names = (seen.length ? seen : knownNations()).map((nation) => nation.name);
+    const settings = allSettings();
+
     const form = document.createElement("form");
     form.id = "clop-sheet-sync-form";
     form.innerHTML = `
-      <center><h5>Spreadsheet Sync for <b class="clop-nation"></b></h5></center>
+      <center><h5>Spreadsheet Sync</h5></center>
       <center><table>
-        <tr><td>Dashboard Column Name</td><td><input name="dashboardColumn" class="form-control" style="width:200px;" placeholder="e.g. LePone(Z)" autocomplete="off"/></td></tr>
-        <tr><td>Sheet Name</td><td><input name="sheetName" class="form-control" style="width:200px;" placeholder="your nation's tab" autocomplete="off"/></td></tr>
+        <tr><th>Nation</th><th>Dashboard Column Name</th><th>Sheet Name</th></tr>
       </table></center>
       <center><input type="submit" value="Save Sheet Settings" class="btn btn-sm btn-warning"/>
       <input type="button" name="syncnow" value="Sync Now" class="btn btn-sm btn-success"/></center>
-      <center><small id="clop-sheet-sync-status"></small></center>
+      <center><small id="clop-sheet-sync-status" style="display:inline-block;text-align:left"></small></center>
       <br/>`;
-    form.querySelector(".clop-nation").textContent = nation;
-    form.dashboardColumn.value = settings.dashboardColumn;
-    form.sheetName.value = settings.sheetName;
-    const save = () => saveSettings(nation, {
-      dashboardColumn: form.dashboardColumn.value.trim(),
-      sheetName: form.sheetName.value.trim(),
-    });
+    const table = form.querySelector("table");
+    for (const name of names) {
+      const row = document.createElement("tr");
+      row.dataset.nation = name;
+      row.innerHTML = `<td style="padding-right:8px"></td>
+        <td><input name="dashboardColumn" class="form-control" style="width:200px;" placeholder="e.g. LePone(Z)" autocomplete="off"/></td>
+        <td><input name="sheetName" class="form-control" style="width:200px;" placeholder="its own tab" autocomplete="off"/></td>`;
+      row.cells[0].textContent = name;
+      const current = settings[name] || {};
+      row.querySelector('[name="dashboardColumn"]').value = current.dashboardColumn || "";
+      row.querySelector('[name="sheetName"]').value = current.sheetName || "";
+      table.appendChild(row);
+    }
+    const save = () => {
+      for (const row of table.querySelectorAll("tr[data-nation]")) {
+        saveSettings(row.dataset.nation, {
+          dashboardColumn: row.querySelector('[name="dashboardColumn"]').value.trim(),
+          sheetName: row.querySelector('[name="sheetName"]').value.trim(),
+        });
+      }
+    };
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       save();
-      saveState(nation, { digest: null, error: null, problems: [], checkedAt: 0 });
-      runSync(nation, { force: true });
+      for (const name of names) saveState(name, { digest: null, error: null, problems: [], checkedAt: 0 });
+      runRound({ force: true });
     });
     form.syncnow.addEventListener("click", () => {
       save();
-      runSync(nation, { force: true });
+      runRound({ force: true });
     });
     anchor.parentNode.insertBefore(form, anchor);
   }
 
+  // ------------------------------------------------------------------------------------------
+
   function main() {
-    if (!isLoggedIn(document)) return;
-    const nation = navbarNation(document);
-    if (!nation) return;
-    if (location.pathname.endsWith("userinfo.php")) addSettingsForm(nation);
-    runSync(nation);
-    // Keep syncing while the tab stays open. Every tab runs this; the shared lock and last-attempt
-    // time keep it to one sync a minute however many tabs there are.
-    // Checking more often than the interval is what lets the throttle fire on the minute.
-    setInterval(() => runSync(nation), SYNC_MIN_INTERVAL_MS / 4);
+    if (ON_GAME) {
+      // Your own page load counts toward the one-request-a-second limit too, from when the server
+      // finished answering it.
+      const navigation = performance.getEntriesByType("navigation")[0];
+      const answered = Math.round(performance.timeOrigin + (navigation ? navigation.responseEnd : 0));
+      GM_setValue("lastGameRequest", Math.max(GM_getValue("lastGameRequest", 0), answered));
+      if (location.pathname.startsWith("/api/") || !isLoggedIn(document)) return;
+      rememberNations(navbarNations(document).all);
+      if (installGuard()) return;
+      if (location.pathname.endsWith("userinfo.php")) addSettingsForm();
+      render();
+      for (const key of ["state", "round", "lock", "settings", "ui.expanded"]) GM_addValueChangeListener(key, () => render());
+    }
+    runRound();
+    // Checking more often than the interval is what lets the throttle fire on time.
+    setInterval(() => runRound(), (ON_GAME ? SYNC_MIN_INTERVAL_MS : OFFSITE_INTERVAL_MS) / 4);
   }
 
   main();

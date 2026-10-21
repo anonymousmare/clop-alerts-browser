@@ -1,9 +1,10 @@
 // End-to-end check of clop-sheet-sync.user.js in a real Chromium.
 //
-// The game is served from fixtures (the page markup is the live game's), the sheet is a fake
-// Apps Script endpoint loaded from the two TSV exports in fixtures/, and Tampermonkey's GM_* API is
-// shimmed. Run with:  node test/run.mjs
+// The game is a fake served from fixtures (the page markup is the live game's) that remembers which
+// nation the session is on, the sheet is a fake Apps Script endpoint loaded from the two TSV
+// exports in fixtures/, and Tampermonkey's GM_* API is shimmed. Run with:  node test/run.mjs
 //
+// The script spaces its game requests a second apart, so a full run takes a couple of minutes.
 // Needs Playwright. It is resolved from the project, then from the global npm root.
 
 import { createRequire } from "node:module";
@@ -59,9 +60,8 @@ class FakeSheet {
     this.log = [];
   }
   get(tab, a1) {
-    const grid = this.tabs[tab];
     const { r0, c0 } = bounds(a1);
-    const value = grid[r0] && grid[r0][c0];
+    const value = this.tabs[tab][r0] && this.tabs[tab][r0][c0];
     return value === undefined ? "" : value;
   }
   set(tab, a1, value) {
@@ -114,26 +114,69 @@ function freshSheet(options) {
   return new FakeSheet({
     "Dashboard-Stockpile": parseTsv(fixture("dashboard-stockpile.tsv")),
     VladihoofstockZ: parseTsv(fixture("nation-tab.tsv")),
+    LanathesisZ: parseTsv(fixture("nation-tab.tsv")),
   }, options);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fake game
+// Fake game: one session, which remembers its active nation like the real one
 
 const SERVER_TIME = "2026-10-21 00:43:34";
-const plainNation = "<li><a>Vladihoofstock</a></li>";
-const switcher =
-  `<li><a><form action="" method="post"><select name="switchnation_id" onchange='this.form.submit()'>` +
-  `<option value="99">Other Nation</option><option value="16" selected >Vladihoofstock</option></select></form></a></li>`;
+const VLAD = { id: 16, name: "Vladihoofstock" };
+const LANA = { id: 3, name: "Lanathesis" };
 
-function page(title, content, { nationLine = plainNation, loggedIn = true } = {}) {
-  let html = fixture("chrome.html")
-    .replace("{{TITLE}}", title)
-    .replace("{{NATIONLINE}}", nationLine)
-    .replace("{{SERVERTIME}}", SERVER_TIME)
-    .replace("{{CONTENT}}", content);
-  if (!loggedIn) html = html.replace('<li><a href="logout.php">Logout</a></li>', "");
-  return html;
+/** Lanathesis's overview: the same page shape, with its own name, id and apples. */
+const overviewFor = (nation) => nation.id === VLAD.id
+  ? fixture("overview.content.html")
+  : fixture("overview.content.html")
+    .replace("<h3>Vladihoofstock</h3>", `<h3>${nation.name}</h3>`)
+    .replace("nation_id=16", `nation_id=${nation.id}`)
+    .replace('<span class="text-success">20,868</span>', '<span class="text-success">11,111</span>');
+
+class FakeGame {
+  constructor({ nations = [VLAD], loggedOut = false, extraForces = false } = {}) {
+    this.nations = nations;
+    this.active = nations[0].id;
+    this.loggedOut = loggedOut;
+    this.extraForces = extraForces;
+    this.log = [];
+  }
+  get activeNation() {
+    return this.nations.find((nation) => nation.id === this.active);
+  }
+  page(title, content, { loggedIn = true } = {}) {
+    const nationLine = this.nations.length === 1
+      ? `<li><a>${this.activeNation.name}</a></li>`
+      : `<li><a><form action="" method="post"><select name="switchnation_id" onchange='this.form.submit()'>` +
+        this.nations.map((n) => `<option value="${n.id}"${n.id === this.active ? " selected " : ""}>${n.name}</option>`).join("") +
+        `</select></form></a></li>`;
+    let html = fixture("chrome.html")
+      .replace("{{TITLE}}", title)
+      .replace("{{NATIONLINE}}", nationLine)
+      .replace("{{SERVERTIME}}", SERVER_TIME)
+      .replace("{{CONTENT}}", content);
+    if (!loggedIn) html = html.replace('<li><a href="logout.php">Logout</a></li>', "");
+    return html;
+  }
+  /** Answer one request: {contentType, body}. A POSTed switchnation_id switches, as allfunctions.php does. */
+  handle(method, url, body) {
+    const name = new URL(url).pathname.replace(/^\//, "");
+    const form = new URLSearchParams(body || "");
+    if (name.endsWith(".php")) this.log.push({ at: Date.now(), method, name, form: Object.fromEntries(form) });
+    const switchTo = parseInt(form.get("switchnation_id"), 10);
+    if (method === "POST" && this.nations.some((nation) => nation.id === switchTo)) this.active = switchTo;
+
+    const html = (text) => ({ contentType: "text/html", body: text });
+    if (name === "api/public/v1.php") return { contentType: "application/json", body: fixture("api.json") };
+    if (this.loggedOut && name === "overview.php") return html(this.page("Login", "<center>Please log in.</center>", { loggedIn: false }));
+    if (name === "overview.php") return html(this.page("Overview", overviewFor(this.activeNation)));
+    if (name === "deals.php") return html(this.page("Deals", fixture("deals.content.html")));
+    if (name === "groupforces.php") {
+      return html(this.page("Group Forces", fixture(this.extraForces ? "groupforces-extra.content.html" : "groupforces.content.html")));
+    }
+    if (name === "userinfo.php") return html(this.page("User Info", fixture("userinfo.content.html")));
+    return html(this.page("News", "<center>news</center>"));
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,72 +185,74 @@ function page(title, content, { nationLine = plainNation, loggedIn = true } = {}
 const shims = `
   (() => {
     const store = () => JSON.parse(localStorage.getItem("__gm") || "{}");
+    const listeners = {};
     window.GM_getValue = (key, fallback) => (key in store() ? store()[key] : fallback);
     window.GM_setValue = (key, value) => {
       const all = store();
+      const old = all[key];
       all[key] = value;
       localStorage.setItem("__gm", JSON.stringify(all));
+      for (const listener of listeners[key] || []) listener(key, old, value, false);
     };
+    window.GM_addValueChangeListener = (key, listener) => (listeners[key] = listeners[key] || []).push(listener);
     window.GM_xmlhttpRequest = (details) => {
-      window.__sheetCall(details.data).then(
-        (body) => details.onload({ status: 200, responseText: body, finalUrl: details.url }),
+      const call = /script\\.google/.test(details.url)
+        ? window.__sheetCall(details.data).then((body) => ({ status: 200, body }))
+        : window.__gameCall(details.method, details.url, details.data || "");
+      call.then(
+        (reply) => details.onload({ status: reply.status, responseText: reply.body, finalUrl: details.url }),
         () => details.onerror({}));
     };
   })();
   document.addEventListener("DOMContentLoaded", () => { ${userscript} });
 `;
 
-async function open(browser, sheet, gameOptions = {}) {
+async function open(browser, sheet, game = new FakeGame()) {
   const context = await browser.newContext();
   const tab = await context.newPage();
   tab.on("pageerror", (error) => console.error("page error:", error));
   await tab.exposeFunction("__sheetCall", (data) => JSON.stringify(sheet.handle(JSON.parse(data))));
+  await tab.exposeFunction("__gameCall", (method, url, data) => ({ status: 200, body: game.handle(method, url, data).body }));
   await tab.addInitScript(shims);
   await context.route("https://4clop.org/**", (route) => {
-    const url = new URL(route.request().url());
-    const name = url.pathname.replace(/^\//, "");
-    const html = (body) => route.fulfill({ contentType: "text/html", body });
-    if (name === "api/public/v1.php") return route.fulfill({ contentType: "application/json", body: fixture("api.json") });
-    if (name === "overview.php") {
-      return html(gameOptions.overviewLoggedOut
-        ? page("Login", "<center>Please log in.</center>", { loggedIn: false })
-        : page("Overview", fixture("overview.content.html"), gameOptions));
-    }
-    if (name === "deals.php") return html(page("Deals", fixture("deals.content.html"), gameOptions));
-    if (name === "groupforces.php") {
-      const body = gameOptions.extraForces ? "groupforces-extra.content.html" : "groupforces.content.html";
-      return html(page("Group Forces", fixture(body), gameOptions));
-    }
-    if (name === "userinfo.php") return html(page("User Info", fixture("userinfo.content.html"), gameOptions));
-    return html(page("News", "<center>news</center>", gameOptions));
+    const request = route.request();
+    const reply = game.handle(request.method(), request.url(), request.postData());
+    return route.fulfill({ contentType: reply.contentType, body: reply.body });
   });
+  await context.route("https://example.com/**", (route) =>
+    route.fulfill({ contentType: "text/html", body: "<!doctype html><html><body><p>Some other site</p></body></html>" }));
   return tab;
 }
 
-async function configure(tab, dashboardColumn, sheetName) {
+/** Fill the User Info form: {nation: [dashboardColumn, sheetName]}. */
+async function configure(tab, rows) {
   await tab.goto("https://4clop.org/userinfo.php");
-  await tab.fill('#clop-sheet-sync-form input[name="dashboardColumn"]', dashboardColumn);
-  await tab.fill('#clop-sheet-sync-form input[name="sheetName"]', sheetName);
+  for (const [nation, [column, sheetName]] of Object.entries(rows)) {
+    await tab.fill(`#clop-sheet-sync-form tr[data-nation="${nation}"] input[name="dashboardColumn"]`, column);
+    await tab.fill(`#clop-sheet-sync-form tr[data-nation="${nation}"] input[name="sheetName"]`, sheetName);
+  }
   await tab.click('#clop-sheet-sync-form input[type="submit"]');
-  return waitForResult(tab);
+  return waitForResult(tab, Object.keys(rows).length);
 }
+const VLAD_ROWS = { Vladihoofstock: ["Vladihoofstock(Z)", "VladihoofstockZ"] };
 
-async function waitForResult(tab) {
-  await tab.waitForFunction(() => {
+/** Wait until the round is over and `count` nations report a result (or the round failed). */
+async function waitForResult(tab, count = 1) {
+  await tab.waitForFunction((n) => {
     const t = document.getElementById("clop-sheet-sync-status")?.textContent || "";
-    return /synced at|failed/.test(t);
-  }, null, { timeout: 15000 });
+    if (/Syncing/.test(t)) return false;
+    return (t.match(/synced at|failed/g) || []).length >= n || /Not logged in|Sync failed/.test(t);
+  }, count, { timeout: 60000 });
   return tab.textContent("#clop-sheet-sync-status");
 }
 
-/** Every cell of `tab` that differs between two grids, as "A1 before -> after". */
+/** Every cell that differs between two grids. */
 function diff(before, after) {
   const changes = [];
   for (let r = 0; r < Math.max(before.length, after.length); r++) {
     const a = before[r] || [], b = after[r] || [];
     for (let c = 0; c < Math.max(a.length, b.length); c++) {
-      const x = a[c] ?? "", y = b[c] ?? "";
-      if (x !== y) changes.push(`${String.fromCharCode(65 + c)}${r + 1}`);
+      if ((a[c] ?? "") !== (b[c] ?? "")) changes.push(`${String.fromCharCode(65 + c)}${r + 1}`);
     }
   }
   return changes;
@@ -220,7 +265,7 @@ const test = (name, fn) => tests.push({ name, fn });
 // ---------------------------------------------------------------------------------------------
 // Tests
 
-test("full sync writes buildings, stock, dashboard, deals and market -- and nothing else", async (browser) => {
+test("full sync writes buildings, stock, troops, dashboard, deals and market -- and nothing else", async (browser) => {
   const sheet = freshSheet();
   // Make a few cells wrong so there is something to correct.
   sheet.set("VladihoofstockZ", "B9", 0);       // Basic Mine have (game: 138)
@@ -232,9 +277,10 @@ test("full sync writes buildings, stock, dashboard, deals and market -- and noth
   sheet.set("Dashboard-Stockpile", "J9", 99);  // Oil - tick (game: 16)
   const before = { dash: clone(sheet.tabs["Dashboard-Stockpile"]), nation: clone(sheet.tabs.VladihoofstockZ) };
 
-  const tab = await open(browser, sheet);
-  const status = await configure(tab, "Vladihoofstock(Z)", "VladihoofstockZ");
-  assert.match(status, /synced at .* \(\d+ cell/, status);
+  const game = new FakeGame();
+  const tab = await open(browser, sheet, game);
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Vladihoofstock synced at .* \(\d+ cell/, status);
 
   const get = (t, a1) => sheet.get(t, a1);
   const D = "Dashboard-Stockpile", N = "VladihoofstockZ";
@@ -279,16 +325,105 @@ test("full sync writes buildings, stock, dashboard, deals and market -- and noth
   const nationChanged = diff(before.nation, sheet.tabs[N]);
   assert.ok(nationChanged.every((a1) => /^(B|R|W)\d+$/.test(a1)), `nation cells outside B/R/W: ${nationChanged}`);
 
-  // A second sync with nothing changed in the game writes nothing (the badge click forces one).
+  // A page load soon after, with nothing changed in the game, does not sync again.
   const writes = sheet.log.length;
+  const requests = game.log.length;
   await tab.goto("https://4clop.org/news.php");
-  await tab.waitForTimeout(500);
-  assert.equal(sheet.log.length, writes, "an unchanged, recent sync wrote again");
-  await tab.click("#clop-sheet-sync-badge");
-  await tab.waitForFunction(() => /synced at/.test(document.getElementById("clop-sheet-sync-badge").textContent));
-  await tab.waitForTimeout(300);
+  await tab.waitForTimeout(1500);
+  assert.equal(game.log.length, requests + 1, `a page load within the minute started another round: ${game.log.slice(requests).map((e) => e.method + " " + e.name)}`);
+  assert.equal(sheet.log.length, writes);
+
+  // The badge opens to a Sync now button, which forces a round: only the two timestamps move.
+  await tab.click("#clop-sheet-sync-badge button");                // the collapsed pill
+  await tab.click("#clop-sheet-sync-badge button:has-text('Sync now')");
+  await tab.waitForFunction(() => /Sync now/.test(document.getElementById("clop-sheet-sync-badge").textContent));
   const extra = sheet.log.slice(writes).map((op) => `${op.tab}!${op.range}`);
   assert.deepEqual(extra.sort(), ["Dashboard-Stockpile!J3:J3", "VladihoofstockZ!W10:W10"], `forced resync wrote ${extra}`);
+  // ...and collapses again, remembering it.
+  await tab.click("#clop-sheet-sync-badge button[title='Collapse']");
+  await tab.reload();
+  await tab.waitForSelector("#clop-sheet-sync-badge");
+  assert.match(await tab.textContent("#clop-sheet-sync-badge"), /^✓ Sheet$/);
+  await tab.context().close();
+});
+
+test("game requests are spaced at least a second apart", async (browser) => {
+  const game = new FakeGame({ nations: [VLAD, LANA] });
+  const tab = await open(browser, freshSheet(), game);
+  await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
+  const times = game.log.map((entry) => entry.at);
+  const gaps = times.slice(1).map((t, i) => t - times[i]);
+  // Your userinfo.php load, then 8 from the script: overview, deals, forces; switch, deals, forces;
+  // switch back; the API.
+  assert.equal(game.log.length, 9, game.log.map((e) => `${e.method} ${e.name}`).join(", "));
+  assert.ok(Math.min(...gaps) >= 950, `gaps: ${gaps}`);
+  await tab.context().close();
+});
+
+test("every nation in the empire gets its own row and is synced by switching and switching back", async (browser) => {
+  const sheet = freshSheet();
+  const game = new FakeGame({ nations: [VLAD, LANA] });
+  const tab = await open(browser, sheet, game);
+  await tab.goto("https://4clop.org/userinfo.php");
+  const rows = await tab.$$eval("#clop-sheet-sync-form tr[data-nation]", (trs) => trs.map((tr) => tr.cells[0].textContent));
+  assert.deepEqual(rows, ["Vladihoofstock", "Lanathesis"]);
+
+  const status = await configure(tab, { ...VLAD_ROWS, Lanathesis: ["Lanathesis(Z)", "LanathesisZ"] });
+  assert.match(status, /Vladihoofstock synced at/, status);
+  assert.match(status, /Lanathesis synced at/, status);
+  assert.equal(sheet.get("Dashboard-Stockpile", "J19"), 20868);   // Vladihoofstock's apples
+  assert.equal(sheet.get("Dashboard-Stockpile", "M19"), 11111);   // Lanathesis's apples
+  assert.equal(sheet.get("LanathesisZ", "R11"), 11111);
+  assert.equal(game.active, VLAD.id, "the session was not switched back");
+  const switches = game.log.filter((entry) => entry.form.switchnation_id).map((entry) => Number(entry.form.switchnation_id));
+  assert.deepEqual(switches, [LANA.id, VLAD.id]);
+  await tab.context().close();
+});
+
+test("a form submitted while another nation is being read is held, then sent with its button", async (browser) => {
+  const game = new FakeGame({ nations: [VLAD, LANA] });
+  const tab = await open(browser, freshSheet(), game);
+  await tab.goto("https://4clop.org/userinfo.php");
+  await tab.evaluate(() => GM_setValue("rotation", { home: { id: 16, name: "Vladihoofstock" }, started: Date.now(), beat: Date.now() }));
+  await tab.click('input[name="changeemail"]');
+  await tab.waitForSelector("#clop-sheet-sync-wait");
+  await tab.waitForTimeout(600);
+  assert.equal(game.log.filter((entry) => entry.method === "POST").length, 0, "the form went through mid-visit");
+
+  await tab.evaluate(() => GM_setValue("rotation", null));
+  await tab.waitForFunction(() => !document.getElementById("clop-sheet-sync-wait"));
+  await tab.waitForLoadState();
+  await tab.waitForTimeout(300);
+  const posts = game.log.filter((entry) => entry.method === "POST");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].name, "userinfo.php");
+  assert.equal(posts[0].form.changeemail, "Change Email");
+  await tab.context().close();
+});
+
+test("a visit abandoned mid-way (tab closed) is switched back by the next tab", async (browser) => {
+  const game = new FakeGame({ nations: [VLAD, LANA] });
+  const tab = await open(browser, freshSheet(), game);
+  await configure(tab, VLAD_ROWS);
+  game.active = LANA.id; // as if a tab closed while it was on Lanathesis
+  await tab.evaluate(() => GM_setValue("rotation", { home: { id: 16, name: "Vladihoofstock" }, started: Date.now() - 60000, beat: Date.now() - 60000 }));
+  await tab.evaluate(() => GM_setValue("lock", 0));
+  await tab.goto("https://4clop.org/news.php");
+  await tab.waitForFunction(() => GM_getValue("rotation", null) === null, null, { timeout: 30000 });
+  assert.equal(game.active, VLAD.id);
+  await tab.context().close();
+});
+
+test("it syncs from a tab on another site, and shows nothing there", async (browser) => {
+  const sheet = freshSheet();
+  sheet.set("VladihoofstockZ", "B9", 0);
+  const tab = await open(browser, sheet);
+  await tab.goto("https://example.com/");
+  await tab.evaluate(() => GM_setValue("settings", { Vladihoofstock: { dashboardColumn: "Vladihoofstock(Z)", sheetName: "VladihoofstockZ" } }));
+  await tab.reload();
+  await tab.waitForFunction(() => (GM_getValue("state", {}).Vladihoofstock || {}).checkedAt, null, { timeout: 30000 });
+  assert.equal(sheet.get("VladihoofstockZ", "B9"), 138);
+  assert.equal(await tab.$("#clop-sheet-sync-badge"), null);
   await tab.context().close();
 });
 
@@ -297,7 +432,7 @@ test("an older endpoint without batch still gets the same writes, one call each"
   const single = freshSheet({ batch: false });
   for (const sheet of [batched, single]) {
     const tab = await open(browser, sheet);
-    const status = await configure(tab, "Vladihoofstock(Z)", "VladihoofstockZ");
+    const status = await configure(tab, VLAD_ROWS);
     assert.match(status, /synced at/, status);
     await tab.context().close();
   }
@@ -308,15 +443,12 @@ test("a wrong Dashboard Column Name skips the dashboard but still updates the na
   const sheet = freshSheet();
   sheet.set("VladihoofstockZ", "B9", 0);
   const dash = clone(sheet.tabs["Dashboard-Stockpile"]);
-  const tab = await open(browser, sheet, { nationLine: switcher });
-  const status = await configure(tab, "Vladihoofstock", "VladihoofstockZ");
+  const tab = await open(browser, sheet);
+  const status = await configure(tab, { Vladihoofstock: ["Vladihoofstock", "VladihoofstockZ"] });
   assert.match(status, /1 problem/, status);
   assert.match(status, /no column in row 1 of Dashboard-Stockpile is named "Vladihoofstock"/);
   assert.deepEqual(sheet.tabs["Dashboard-Stockpile"], dash);
   assert.equal(sheet.get("VladihoofstockZ", "B9"), 138);
-  // Settings were stored for the nation the switcher has selected.
-  const stored = await tab.evaluate(() => Object.keys(GM_getValue("settings", {})));
-  assert.deepEqual(stored, ["Vladihoofstock"]);
   await tab.context().close();
 });
 
@@ -324,7 +456,7 @@ test("a duplicated label refuses only the block it is in", async (browser) => {
   const sheet = freshSheet();
   sheet.set("Dashboard-Stockpile", "A87", "Oil"); // a second "Oil" inside the Market block
   const tab = await open(browser, sheet);
-  const status = await configure(tab, "Vladihoofstock(Z)", "VladihoofstockZ");
+  const status = await configure(tab, VLAD_ROWS);
   assert.match(status, /"Oil" appears 2 times in the Market block/, status);
   assert.equal(sheet.get("Dashboard-Stockpile", "J86"), "");     // market untouched
   assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);   // deals still written
@@ -334,28 +466,29 @@ test("a duplicated label refuses only the block it is in", async (browser) => {
 test("troop counts that do not add up to overview's military upkeep leave the TROOPS block alone", async (browser) => {
   const sheet = freshSheet();
   sheet.set("VladihoofstockZ", "R40", 9);
-  const tab = await open(browser, sheet, { extraForces: true });
-  const status = await configure(tab, "Vladihoofstock(Z)", "VladihoofstockZ");
+  const tab = await open(browser, sheet, new FakeGame({ extraForces: true }));
+  const status = await configure(tab, VLAD_ROWS);
   assert.match(status, /would use 10 gems, 15 gasoline but overview\.php says your military uses 0 gems, 0 gasoline/, status);
   assert.equal(sheet.get("VladihoofstockZ", "R40"), 9);          // untouched
   assert.equal(sheet.get("Dashboard-Stockpile", "J52"), 5000);   // everything else still synced
   await tab.context().close();
 });
 
-test("a logged-out overview writes nothing", async (browser) => {
+test("a logged-out session writes nothing", async (browser) => {
   const sheet = freshSheet();
-  const tab = await open(browser, sheet, { overviewLoggedOut: true });
-  const status = await configure(tab, "Vladihoofstock(Z)", "VladihoofstockZ");
-  assert.match(status, /failed: overview\.php/, status);
+  const tab = await open(browser, sheet, new FakeGame({ loggedOut: true }));
+  const status = await configure(tab, VLAD_ROWS);
+  assert.match(status, /Not logged in to 4clop\.org/, status);
   assert.equal(sheet.log.length, 0);
   await tab.context().close();
 });
 
 // ---------------------------------------------------------------------------------------------
 
+const only = process.argv[2];
 const browser = await chromium.launch();
 let failed = 0;
-for (const { name, fn } of tests) {
+for (const { name, fn } of tests.filter((t) => !only || t.name.includes(only))) {
   try {
     await fn(browser);
     console.log(`ok   - ${name}`);
@@ -365,5 +498,5 @@ for (const { name, fn } of tests) {
   }
 }
 await browser.close();
-console.log(failed ? `\n${failed} failed` : `\nall ${tests.length} passed`);
+console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);
